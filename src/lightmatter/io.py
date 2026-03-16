@@ -226,7 +226,7 @@ def save_simulation_run(
     print(f"Simulation saved to: {folder}")
 
 
-def load_simulation_run(folder: str):
+def load_simulation_run(folder: str, nosnaps = False):
     """
     Load simulation results and reconstruct parameter classes.
 
@@ -265,14 +265,23 @@ def load_simulation_run(folder: str):
         eps_inf=data["eps_inf"],
     )
 
-    result = {
-        "params": params,
-        "pulse": pulse,
-        "material": material,
-        "E_t": data["E_t"],
-        "E_r": data["E_r"],
-        "snaps_t": data["snaps_t"],
-        "snaps_E": data["snaps_E"],
-    }
+    if nosnaps:
+        result = {
+            "params": params,
+            "pulse": pulse,
+            "material": material,
+            "E_t": data["E_t"],
+            "E_r": data["E_r"],
+        }
+    else:
+        result = {
+            "params": params,
+            "pulse": pulse,
+            "material": material,
+            "E_t": data["E_t"],
+            "E_r": data["E_r"],
+            "snaps_t": data["snaps_t"],
+            "snaps_E": data["snaps_E"],
+        }
 
     return result

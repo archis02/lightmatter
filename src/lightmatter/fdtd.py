@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
-from numba import njit
+from numba import njit, prange
 import matplotlib.pyplot as plt
 import sys
 from scipy.optimize import least_squares
@@ -17,7 +17,8 @@ unit_T = 1e-12
 unit_L = 1e-10
 # unit_E = 5.686e2
 
-c0  = 3.0e6 # in code units
+c0  = 2.9979e6 # in code units
+c0_SI = 299_792_458.0
 # mu0 = 4e-7 * np.pi
 # eps0 = 1.0 / (mu0 * c0**2)
 # Z0 = np.sqrt(mu0 / eps0)
@@ -30,6 +31,7 @@ class PulseParams:
     t0: float
     tau: float
     phase: float = 0.0
+    type: str = "gaussian"
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +150,41 @@ def gaussian_sine(t, E0, f0, t0, tau, phase=0.0):
     return E0 * np.cos(2*np.pi*f0*(t-t0) + phase) * np.exp(-0.5*((t - t0)/tau)**2)
 
 
+@njit
+def boxed_pulse(t, E0, f0, t0, tau, phase=0.0):
+
+    check = (t < (t0 + tau)) & (t >= (t0 - tau))
+
+    pulse = 0.0
+    if check:
+        pulse = E0 * np.cos(2*np.pi*f0*(t-t0) + phase)
+
+    return pulse
+
+
+@njit
+def smooth_boxed_pulse(t, E0, f0, t0, tau, phase=0.0):
+    tramp = 0.1 * 2.0*tau
+    x = np.abs(t - t0)
+
+    # outside pulse support
+    if x > tau:
+        return 0.0
+
+    # fully flat central region
+    if x <= (tau - tramp):
+        env = 1.0
+
+    # raised-cosine edge
+    else:
+        s = (x - (tau - tramp)) / tramp   # goes 0 -> 1 across edge
+        env = 0.5 * (1.0 + np.cos(np.pi * s))
+
+    result = E0 * env * np.cos(2.0 * np.pi * f0 * (t - t0) + phase)
+
+    return result
+
+
 def build_pml_1d(
     Nz: int,
     dz: float,
@@ -235,7 +272,7 @@ def build_pml_1d(
     return bE, cE, bH, cH, sigmaE_by_eps0
 
 
-@njit
+@njit(parallel=True)
 def run_fdtd_with_pml_time_dep(
     Nz, Nt, dz, dt,
     src_i,                       # source cell index
@@ -243,7 +280,7 @@ def run_fdtd_with_pml_time_dep(
     probe_r_i,                   # reflected probe index
     metal_i0, metal_i1,          # metal region [i0, i1)
     omega_D, gamma_D, omega_L, gamma_L, del_eps, eps_inf,   # model params, now time-dependent arrays
-    E0, f0, t0, tau, phase,      # source waveform params
+    E0, f0, t0, tau, phase, pulsetype,      # source waveform params
     bE, cE, bH, cH,              # PML coefficients
     snap_every=50
 ):
@@ -296,11 +333,11 @@ def run_fdtd_with_pml_time_dep(
         C_gamma = 1.0 / (eps_inf[n] + chi_0 + sigma_D*dt)
 
         # --- Update H (n+1/2) from E(n), with PML coefficients
-        for i in range(Nz-1):
+        for i in prange(Nz-1):
             H_by_eps0[i] = bH[i] * H_by_eps0[i] - cH[i] * (E[i+1] - E[i])
 
         # Interior update
-        for i in range(1, Nz-1):
+        for i in prange(1, Nz-1):
             curlH = - H_by_eps0[i] + H_by_eps0[i-1]
 
             # It is assumed that the metal is not near the boundary, where the PML is active
@@ -312,7 +349,14 @@ def run_fdtd_with_pml_time_dep(
                 E[i] = bE[i] * E[i] + cE[i] * curlH
 
         # --- Source injection (soft source)
-        E[src_i] += gaussian_sine(t, E0, f0, t0, tau, phase)
+        if pulsetype == "gaussian":
+            E[src_i] += gaussian_sine(t, E0, f0, t0, tau, phase)
+        elif pulsetype == "boxed" or pulsetype=="box":
+            E[src_i] += boxed_pulse(t, E0, f0, t0, tau, phase)
+        elif pulsetype =="smoothed box":
+            E[src_i] += smooth_boxed_pulse(t, E0, f0, t0, tau, phase)
+        else:
+            raise ValueError("invalid pulse name")
 
         # For completeness, update boundaries E[0], E[Nz-1] similarly using one-sided curl.
         # In PML this is usually fine; use nearest curl value.
@@ -355,7 +399,7 @@ def run_simulation(
         material.omega_D, material.gamma_D,
         material.omega_L, material.gamma_L,
         material.del_eps, material.eps_inf,
-        pulse.E0, pulse.f0, pulse.t0, pulse.tau, pulse.phase,
+        pulse.E0, pulse.f0, pulse.t0, pulse.tau, pulse.phase, pulse.type,
         bE, cE, bH, cH,
         params.snap_every,
     )
@@ -403,6 +447,69 @@ def transmission_coeff_analytical(n, k, d, w, c0_SI=299_792_458.0):
     t_sq = (tau_12_sq * tau_23_sq * exp_2v_2_eta_inv) / denom
 
     return np.sqrt(t_sq) * phase
+
+
+def transmission_finite_reflections(
+    n: float,
+    k: float,
+    d_m: float,
+    w: float,
+    N_reflections: int,
+    c0_SI=299_792_458.0,
+):
+    """
+    Parameters
+    ----------
+    n, k : float
+        Real and imaginary parts of film refractive index: n2 = n + i k.
+    d_m : float
+        Film thickness (meters).
+    w : float
+        2*pi*frequency
+    N_reflections : int
+        Number of internal reflections/round-trips to include (N >= 0).
+        N=0 -> only the first transmitted pass (no internal round trips)
+        N→∞ -> converges to standard thin-film Fresnel result (if |q|<1)
+
+    Returns
+    -------
+    tN : complex
+        Complex field transmission coefficient (E_trans / E_inc).
+    """
+    if N_reflections < 0:
+        raise ValueError("N_reflections must be >= 0")
+    
+    wavelength_m = 2.0*np.pi * c0_SI / w
+
+    n1 = 1.0 + 0.0j
+    n2 = complex(n, k)
+    n3 = 1.0 + 0.0j
+
+    # Fresnel amplitude coefficients at normal incidence
+    r12 = (n1 - n2) / (n1 + n2)
+    t12 = (2.0 * n1) / (n1 + n2)
+
+    r21 = (n2 - n1) / (n2 + n1)
+    t23 = (2.0 * n2) / (n2 + n3)
+
+    r23 = (n2 - n3) / (n2 + n3)
+
+    # Propagation phase through the film
+    k0 = 2.0 * np.pi / wavelength_m
+    delta = k0 * n2 * d_m
+
+    # Truncated geometric series factor
+    q = r21 * r23 * np.exp(2.0j * delta)
+
+    # Handle q ~ 1 numerically (avoid division blow-up)
+    if np.isclose(q, 1.0 + 0.0j):
+        series = (N_reflections + 1)  # sum_{m=0..N} 1 = N+1
+    else:
+        series = (1.0 - q ** (N_reflections + 1)) / (1.0 - q)
+
+    tN = t12 * t23 * np.exp(1.0j * delta) * series
+
+    return tN
 
 
 # ---------------------------
@@ -469,8 +576,9 @@ def retrieve_nk_from_time_traces(
     n0=1.0,
     k0=0.1,
     bounds=((0.0, 0.0), (50.0, 50.0)),
-    max_nfev=200,
+    max_nfev=10000,
     verbose=False,
+    num_reflections=None,
 ):
     """
     Returns:
@@ -512,11 +620,20 @@ def retrieve_nk_from_time_traces(
 
     for i, (wi, t_target) in enumerate(zip(w_fit, t_meas_fit)):
         # residual in R^2 : [Re, Im]
-        def fun(x):
-            ni, ki = x
-            t_mod = transmission_coeff_analytical(ni, ki, d, wi, c0_SI=c0_SI)
-            r = t_mod - t_target
-            return np.array([r.real, r.imag], dtype=float)
+
+        if num_reflections is not None:
+            def fun(x):
+                ni, ki = x
+                t_mod = transmission_finite_reflections(ni, ki, d, wi, num_reflections, c0_SI=c0_SI)
+                r = t_mod - t_target
+                return np.abs(r)
+        else:
+            def fun(x):
+                ni, ki = x
+                t_mod = transmission_coeff_analytical(ni, ki, d, wi, c0_SI=c0_SI)
+                r = t_mod - t_target
+                # return np.array([r.real, r.imag], dtype=float)
+                return np.abs(r)
 
         res = least_squares(
             fun,
@@ -532,7 +649,10 @@ def retrieve_nk_from_time_traces(
 
         if res.success:
             n_fit[i], k_fit[i] = res.x
-            t_model_fit[i] = transmission_coeff_analytical(res.x[0], res.x[1], d, wi, c0_SI=c0_SI)
+            if num_reflections is not None:
+                t_model_fit[i] = transmission_finite_reflections(res.x[0], res.x[1], d, wi, num_reflections, c0_SI=c0_SI)
+            else:
+                t_model_fit[i] = transmission_coeff_analytical(res.x[0], res.x[1], d, wi, c0_SI=c0_SI)
             x_prev = res.x  # continuation
         else:
             # keep previous guess but don't advance it aggressively
