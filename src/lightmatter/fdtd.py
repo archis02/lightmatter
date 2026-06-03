@@ -2,26 +2,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
 from numba import njit, prange
-import matplotlib.pyplot as plt
 import sys
 from scipy.optimize import least_squares
 
-# Units, time = ps => frequency = THz, 
-# mass = m_e, q = e, x = A
-# => E = 5.686e2 V / m
-
-# unit_M = 9.109e-31
-# unit_Q = 1.602e-19
-unit_F = 1e12
-unit_T = 1e-12
-unit_L = 1e-10
-# unit_E = 5.686e2
-
-c0  = 2.9979e6 # in code units
-c0_SI = 299_792_458.0
-# mu0 = 4e-7 * np.pi
-# eps0 = 1.0 / (mu0 * c0**2)
-# Z0 = np.sqrt(mu0 / eps0)
+from .units import C0, C0_SI
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +52,7 @@ class FDTDParams:
     # -----------------
     # Snapshots
     # -----------------
-    snap_every: int = 50  # 0 disables snapshots
+    snap_every: int = 100  # 0 disables snapshots
 
     # -----------------
     # Validation
@@ -189,8 +173,8 @@ def build_pml_1d(
     Nz: int,
     dz: float,
     dt: float,
-    npml: int = 150,
-    R_target: float = 1e-12,
+    npml: int = 250,
+    R_target: float = 1e-16,
     m: int = 4,
 ):
     """
@@ -226,7 +210,7 @@ def build_pml_1d(
         bE = np.ones(Nz)
         cE = np.full(Nz, dt/dz)
         bH = np.ones(Nz-1)
-        cH = np.full(Nz-1, c0*c0*dt/dz)
+        cH = np.full(Nz-1, C0*C0*dt/dz)
         sigmaE_by_eps0 = np.zeros(Nz)
         return bE, cE, bH, cH, sigmaE_by_eps0
 
@@ -234,8 +218,8 @@ def build_pml_1d(
     Lpml = npml * dz
 
     # Common choice for sigma_max (widely used in FDTD texts)
-    # sigma_max ≈ -(m+1) * eps0 * c0 * ln(R) / (2*Lpml)
-    sigma_max_by_eps0 = -(m + 1) * c0 * np.log(R_target) / (2 * Lpml) # unit = 1 / unit_T
+    # sigma_max ≈ -(m+1) * eps0 * C0 * ln(R) / (2*Lpml)
+    sigma_max_by_eps0 = -(m + 1) * C0 * np.log(R_target) / (2 * Lpml) # unit = 1 / UNIT_T
 
     # sigmaE at E nodes
     sigmaE_by_eps0 = np.zeros(Nz, dtype=np.float64)
@@ -267,13 +251,13 @@ def build_pml_1d(
     # for my convention: (1 + sigmaH*dt/(2mu0)) H_by_eps0^{n+1/2} = (1 - sigmaH*dt/(2mu0)) H_by_eps0^{n-1/2} - (dt/(mu0 eps0 dz))(E diff)
     aH = 1.0 + sigmaH_by_mu0 * dt / 2.0
     bH = (1.0 - sigmaH_by_mu0 * dt / 2.0) / aH
-    cH = ( c0*c0* dt / dz) / aH
+    cH = ( C0*C0* dt / dz) / aH
 
     return bE, cE, bH, cH, sigmaE_by_eps0
 
 
 @njit(parallel=True)
-def run_fdtd_with_pml_time_dep(
+def run_fdtd_convolution(
     Nz, Nt, dz, dt,
     src_i,                       # source cell index
     probe_t_i,                   # transmitted probe index
@@ -282,7 +266,7 @@ def run_fdtd_with_pml_time_dep(
     omega_D, gamma_D, omega_L, gamma_L, del_eps, eps_inf,   # model params, now time-dependent arrays
     E0, f0, t0, tau, phase, pulsetype,      # source waveform params
     bE, cE, bH, cH,              # PML coefficients
-    snap_every=50
+    snap_every=20
 ):
     # Fields
     E = np.zeros(Nz, dtype=np.float64)
@@ -378,12 +362,396 @@ def run_fdtd_with_pml_time_dep(
     return E_t, E_r, snaps_t, snaps_E
 
 
+@njit(parallel=True)
+def run_fdtd_exact(
+    Nz, Nt, dz, dt,
+    src_i,                       # source cell index
+    probe_t_i,                   # transmitted probe index
+    probe_r_i,                   # reflected probe index
+    metal_i0, metal_i1,          # metal region [i0, i1)
+    omega_D, gamma_D, omega_L, gamma_L, del_eps, eps_inf,   # time-dependent arrays
+    E0, f0, t0, tau, phase, pulsetype,                      # source waveform params
+    bE, cE, bH, cH,                                         # PML coefficients
+    snap_every=20
+):
+    """
+    1D Yee FDTD with PML and a genuinely time-dependent Drude-Lorentz medium.
+
+    This version removes the adiabatic recursive-convolution update and instead
+    advances the material dynamics directly:
+
+        dJ_D/dt + gamma_D(t) J_D = omega_D(t)^2 E
+        dP_L/dt = J_L
+        dJ_L/dt + gamma_L(t) J_L + omega_L(t)^2 P_L
+            = del_eps(t) * omega_L(t)^2 * E
+
+    together with Ampere's law in normalized form
+
+        d/dt [eps_inf(t) E + P_L] + J_D = d(H/eps0)/dz .
+
+    Here J_D, J_L, P_L are understood as polarization/current variables divided
+    by eps0, consistent with the H_by_eps0 convention already used in this file.
+    """
+
+    # -------------------------
+    # Fields / material states
+    # -------------------------
+    E = np.zeros(Nz, dtype=np.float64)
+    E_old = np.zeros(Nz, dtype=np.float64)
+
+    H_by_eps0 = np.zeros(Nz - 1, dtype=np.float64)   # H / eps0 on Yee edges
+
+    # Drude current (stored at half steps conceptually; numerically advanced in place)
+    J_D = np.zeros(Nz, dtype=np.float64)
+
+    # Lorentz polarization and Lorentz current
+    P_L = np.zeros(Nz, dtype=np.float64)
+    J_L = np.zeros(Nz, dtype=np.float64)
+
+    # -------------------------
+    # Probes
+    # -------------------------
+    E_t = np.zeros(Nt, dtype=np.float64)
+    E_r = np.zeros(Nt, dtype=np.float64)
+
+    # -------------------------
+    # Snapshot storage
+    # -------------------------
+    if snap_every > 0:
+        nsnaps = (Nt + snap_every - 1) // snap_every
+        snaps_E = np.zeros((nsnaps, Nz), dtype=np.float64)
+        snaps_t = np.zeros(nsnaps, dtype=np.float64)
+    else:
+        snaps_E = np.zeros((1, 1), dtype=np.float64)
+        snaps_t = np.zeros(1, dtype=np.float64)
+    snap_k = 0
+
+    # -------------------------
+    # Time stepping
+    # -------------------------
+    for n in range(Nt):
+        t = n * dt
+
+        # Save E^n, because all updates below use the old electric field
+        for i in prange(Nz):
+            E_old[i] = E[i]
+
+        # -------------------------
+        # Update H^{n+1/2} from E^n
+        # -------------------------
+        for i in prange(Nz - 1):
+            H_by_eps0[i] = bH[i] * H_by_eps0[i] - cH[i] * (E_old[i + 1] - E_old[i])
+
+        # Time-slab sampling.
+        # Using midpoint-like averages improves robustness for fast parameter changes.
+        np1 = n + 1
+        if np1 >= Nt:
+            np1 = n
+
+        # -------------------------
+        # Update E^{n+1}
+        # -------------------------
+        for i in prange(1, Nz - 1):
+            curlH = -H_by_eps0[i] + H_by_eps0[i - 1]
+
+            # Dispersive material region
+            if metal_i0 <= i < metal_i1:
+                # Midpoint-sampled material coefficients on the time slab [t_n, t_{n+1}]
+                gD = 0.5 * (gamma_D[n] + gamma_D[np1])
+                wD2 = 0.5 * (
+                    omega_D[n] * omega_D[n] +
+                    omega_D[np1] * omega_D[np1]
+                )
+
+                gL = 0.5 * (gamma_L[n] + gamma_L[np1])
+                wL2 = 0.5 * (
+                    omega_L[n] * omega_L[n] +
+                    omega_L[np1] * omega_L[np1]
+                )
+                sL = 0.5 * (
+                    del_eps[n] * omega_L[n] * omega_L[n] +
+                    del_eps[np1] * omega_L[np1] * omega_L[np1]
+                )
+
+                eps_n = eps_inf[n]
+                eps_np1 = eps_inf[np1]
+
+                # ---- Drude current update
+                # Crank-Nicolson for damping, explicit in E^n
+                #
+                # (J_D^{n+1/2} - J_D^{n-1/2})/dt
+                #   + gD * (J_D^{n+1/2} + J_D^{n-1/2})/2
+                #   = wD2 * E^n
+                denom_D = 1.0 + 0.5 * gD * dt
+                JD_np12 = (
+                    (1.0 - 0.5 * gD * dt) * J_D[i]
+                    + dt * wD2 * E_old[i]
+                ) / denom_D
+
+                # ---- Lorentz update
+                # First-order form:
+                #   dP_L/dt = J_L
+                #   dJ_L/dt + gL J_L + wL2 P_L = sL E
+                #
+                # Semi-implicit/staggered update:
+                denom_L = 1.0 + 0.5 * gL * dt + 0.5 * wL2 * dt * dt
+                JL_np12 = (
+                    (1.0 - 0.5 * gL * dt) * J_L[i]
+                    - dt * wL2 * P_L[i]
+                    + dt * sL * E_old[i]
+                ) / denom_L
+                PL_np1 = P_L[i] + dt * JL_np12
+
+                # ---- Ampere update with time-dependent eps_inf
+                #
+                # [eps_inf^{n+1} E^{n+1} - eps_inf^n E^n]/dt
+                #   + J_D^{n+1/2} + J_L^{n+1/2}
+                #   = curlH / dz
+                E[i] = (
+                    eps_n * E_old[i]
+                    + (dt / dz) * curlH
+                    - dt * (JD_np12 + JL_np12)
+                ) / eps_np1
+
+                # Commit updated material states
+                J_D[i] = JD_np12
+                J_L[i] = JL_np12
+                P_L[i] = PL_np1
+
+            else:
+                # Vacuum / non-dispersive region with precomputed PML coefficients
+                E[i] = bE[i] * E_old[i] + cE[i] * curlH
+
+        # -------------------------
+        # Soft source injection
+        # -------------------------
+        if pulsetype == "gaussian":
+            E[src_i] += gaussian_sine(t, E0, f0, t0, tau, phase)
+        elif pulsetype == "boxed" or pulsetype == "box":
+            E[src_i] += boxed_pulse(t, E0, f0, t0, tau, phase)
+        elif pulsetype == "smoothed box":
+            E[src_i] += smooth_boxed_pulse(t, E0, f0, t0, tau, phase)
+        else:
+            raise ValueError("invalid pulse name")
+
+        # -------------------------
+        # Boundary E update
+        # -------------------------
+        E[0] = bE[0] * E[0] - cE[0] * (H_by_eps0[0] - 0.0)
+        E[Nz - 1] = bE[Nz - 1] * E[Nz - 1] - cE[Nz - 1] * (0.0 - H_by_eps0[Nz - 2])
+
+        # -------------------------
+        # Record probes
+        # -------------------------
+        E_t[n] = E[probe_t_i]
+        E_r[n] = E[probe_r_i]
+
+        # -------------------------
+        # Snapshots
+        # -------------------------
+        if snap_every > 0 and (n % snap_every == 0):
+            snaps_t[snap_k] = t
+            for i in range(Nz):
+                snaps_E[snap_k, i] = E[i]
+            snap_k += 1
+
+    return E_t, E_r, snaps_t, snaps_E
+
+
+@njit(parallel=True)
+def run_fdtd_pml_corrected(
+    Nz, Nt, dz, dt,
+    src_i,
+    probe_t_i,
+    probe_r_i,
+    metal_i0, metal_i1,
+    omega_D, gamma_D, omega_L, gamma_L, del_eps, eps_inf,
+    E0, f0, t0, tau, phase, pulsetype,
+    sigmaE_by_eps0,            # NEW
+    bH, cH,                    # only H PML coeffs are needed explicitly
+    snap_every=200
+):
+    """
+    1D Yee FDTD with conductivity-graded absorber overlapping a genuinely
+    time-dependent Drude-Lorentz medium.
+
+    In cells where the material overlaps the absorber, the E-update uses:
+
+        [eps_inf^{n+1} E^{n+1} - eps_inf^n E^n]/dt
+        + sigma_E * (E^{n+1}+E^n)/2
+        + J_D^{n+1/2} + J_L^{n+1/2}
+        = curlH / dz
+    """
+
+    # -------------------------
+    # Fields / material states
+    # -------------------------
+    E = np.zeros(Nz, dtype=np.float64)
+    E_old = np.zeros(Nz, dtype=np.float64)
+
+    H_by_eps0 = np.zeros(Nz - 1, dtype=np.float64)
+
+    J_D = np.zeros(Nz, dtype=np.float64)
+    P_L = np.zeros(Nz, dtype=np.float64)
+    J_L = np.zeros(Nz, dtype=np.float64)
+
+    # -------------------------
+    # Probes
+    # -------------------------
+    E_t = np.zeros(Nt, dtype=np.float64)
+    E_r = np.zeros(Nt, dtype=np.float64)
+
+    # -------------------------
+    # Snapshots
+    # -------------------------
+    if snap_every > 0:
+        nsnaps = (Nt + snap_every - 1) // snap_every
+        snaps_E = np.zeros((nsnaps, Nz), dtype=np.float64)
+        snaps_t = np.zeros(nsnaps, dtype=np.float64)
+    else:
+        snaps_E = np.zeros((1, 1), dtype=np.float64)
+        snaps_t = np.zeros(1, dtype=np.float64)
+
+    snap_k = 0
+
+    # -------------------------
+    # Time stepping
+    # -------------------------
+    for n in range(Nt):
+        t = n * dt
+
+        # Save old E
+        for i in prange(Nz):
+            E_old[i] = E[i]
+
+        # -------------------------
+        # Update H^{n+1/2}
+        # -------------------------
+        for i in prange(Nz - 1):
+            H_by_eps0[i] = bH[i] * H_by_eps0[i] - cH[i] * (E_old[i + 1] - E_old[i])
+
+        # Time-slab index
+        np1 = n + 1
+        if np1 >= Nt:
+            np1 = n
+
+        # Precompute time-slab material parameters
+        gD = 0.5 * (gamma_D[n] + gamma_D[np1])
+        wD2 = 0.5 * (
+            omega_D[n] * omega_D[n] +
+            omega_D[np1] * omega_D[np1]
+        )
+
+        gL = 0.5 * (gamma_L[n] + gamma_L[np1])
+        wL2 = 0.5 * (
+            omega_L[n] * omega_L[n] +
+            omega_L[np1] * omega_L[np1]
+        )
+
+        sL = 0.5 * (
+            del_eps[n] * omega_L[n] * omega_L[n] +
+            del_eps[np1] * omega_L[np1] * omega_L[np1]
+        )
+
+        eps_n = eps_inf[n]
+        eps_np1 = eps_inf[np1]
+
+        # -------------------------
+        # Update E^{n+1} on ALL cells
+        # -------------------------
+        for i in prange(Nz):
+
+            # One-sided curl at the boundaries, centered in the interior
+            if i == 0:
+                curlH = -H_by_eps0[0]
+            elif i == Nz - 1:
+                curlH = H_by_eps0[Nz - 2]
+            else:
+                curlH = -H_by_eps0[i] + H_by_eps0[i - 1]
+
+            sigma = sigmaE_by_eps0[i]
+
+            # Material region, including overlap with absorber
+            if metal_i0 <= i < metal_i1:
+                # ---- Drude current update
+                denom_D = 1.0 + 0.5 * gD * dt
+                JD_np12 = (
+                    (1.0 - 0.5 * gD * dt) * J_D[i]
+                    + dt * wD2 * E_old[i]
+                ) / denom_D
+
+                # ---- Lorentz current / polarization update
+                denom_L = 1.0 + 0.5 * gL * dt + 0.5 * wL2 * dt * dt
+                JL_np12 = (
+                    (1.0 - 0.5 * gL * dt) * J_L[i]
+                    - dt * wL2 * P_L[i]
+                    + dt * sL * E_old[i]
+                ) / denom_L
+                PL_np1 = P_L[i] + dt * JL_np12
+
+                # ---- Ampere update with absorber + material active together
+                denom_E = eps_np1 + 0.5 * sigma * dt
+                numer_E = (
+                    (eps_n - 0.5 * sigma * dt) * E_old[i]
+                    + (dt / dz) * curlH
+                    - dt * (JD_np12 + JL_np12)
+                )
+                E[i] = numer_E / denom_E
+
+                # Commit material states
+                J_D[i] = JD_np12
+                J_L[i] = JL_np12
+                P_L[i] = PL_np1
+
+            else:
+                # Vacuum / non-dispersive region, including absorber overlap
+                denom_E = 1.0 + 0.5 * sigma * dt
+                numer_E = (
+                    (1.0 - 0.5 * sigma * dt) * E_old[i]
+                    + (dt / dz) * curlH
+                )
+                E[i] = numer_E / denom_E
+
+        # -------------------------
+        # Soft source injection
+        # -------------------------
+        if pulsetype == "gaussian":
+            E[src_i] += gaussian_sine(t, E0, f0, t0, tau, phase)
+        elif pulsetype == "boxed" or pulsetype == "box":
+            E[src_i] += boxed_pulse(t, E0, f0, t0, tau, phase)
+        elif pulsetype == "smoothed box":
+            E[src_i] += smooth_boxed_pulse(t, E0, f0, t0, tau, phase)
+        else:
+            raise ValueError("invalid pulse name")
+
+        # -------------------------
+        # Record probes
+        # -------------------------
+        E_t[n] = E[probe_t_i]
+        E_r[n] = E[probe_r_i]
+
+        # -------------------------
+        # Snapshots
+        # -------------------------
+        if snap_every > 0 and (n % snap_every == 0):
+            snaps_t[snap_k] = t
+            for i in range(Nz):
+                snaps_E[snap_k, i] = E[i]
+            snap_k += 1
+
+    return E_t, E_r, snaps_t, snaps_E
+
+
 def run_simulation(
     params: FDTDParams,
     pulse: PulseParams,
     material: MaterialParamsTD,
+    method = "convolution"
 ):
-    bE, cE, bH, cH, sigmaE = build_pml_1d(
+    if method not in ["convolution", "exact", "exact pml"]:
+        raise ValueError("Unknown method; must be \'convolution\' or \'exact\' or \'exact pml\'")
+    
+    bE, cE, bH, cH, sigmaEbyEpsZero = build_pml_1d(
         Nz=params.Nz,
         dz=params.dz,
         dt=params.dt,
@@ -391,28 +759,54 @@ def run_simulation(
         R_target=params.R_target,
         m=params.m,
     )
+    print(f"Maximum correction: {0.5 * sigmaEbyEpsZero[-1] * params.dt}")
 
-    return run_fdtd_with_pml_time_dep(
-        params.Nz, params.Nt, params.dz, params.dt,
-        params.src_i, params.probe_t_i, params.probe_r_i,
-        params.metal_i0, params.metal_i1,
-        material.omega_D, material.gamma_D,
-        material.omega_L, material.gamma_L,
-        material.del_eps, material.eps_inf,
-        pulse.E0, pulse.f0, pulse.t0, pulse.tau, pulse.phase, pulse.type,
-        bE, cE, bH, cH,
-        params.snap_every,
-    )
+    if method=="convolution":
+        return run_fdtd_convolution(
+            params.Nz, params.Nt, params.dz, params.dt,
+            params.src_i, params.probe_t_i, params.probe_r_i,
+            params.metal_i0, params.metal_i1,
+            material.omega_D, material.gamma_D,
+            material.omega_L, material.gamma_L,
+            material.del_eps, material.eps_inf,
+            pulse.E0, pulse.f0, pulse.t0, pulse.tau, pulse.phase, pulse.type,
+            bE, cE, bH, cH,
+            params.snap_every,
+        )
+    elif method=="exact":
+        return run_fdtd_exact(
+            params.Nz, params.Nt, params.dz, params.dt,
+            params.src_i, params.probe_t_i, params.probe_r_i,
+            params.metal_i0, params.metal_i1,
+            material.omega_D, material.gamma_D,
+            material.omega_L, material.gamma_L,
+            material.del_eps, material.eps_inf,
+            pulse.E0, pulse.f0, pulse.t0, pulse.tau, pulse.phase, pulse.type,
+            bE, cE, bH, cH,
+            params.snap_every,
+        )
+    elif method=="exact pml":
+        return run_fdtd_pml_corrected(
+            params.Nz, params.Nt, params.dz, params.dt,
+            params.src_i, params.probe_t_i, params.probe_r_i,
+            params.metal_i0, params.metal_i1,
+            material.omega_D, material.gamma_D,
+            material.omega_L, material.gamma_L,
+            material.del_eps, material.eps_inf,
+            pulse.E0, pulse.f0, pulse.t0, pulse.tau, pulse.phase, pulse.type,
+            sigmaEbyEpsZero, bH, cH,
+            params.snap_every,
+        )
 
 # ---------------------------
 # Analyze simulation outputs
 # ---------------------------
-def transmission_coeff_analytical(n, k, d, w, c0_SI=299_792_458.0):
+def transmission_coeff_analytical(n, k, d, w):
     # guard against w=0
     w = np.asarray(w, dtype=float)
     w_safe = np.where(w == 0.0, np.finfo(float).tiny, w)
 
-    wavelength = (2.0 * np.pi * c0_SI) / w_safe
+    wavelength = (2.0 * np.pi * C0_SI) / w_safe
     u_2 = n
     v_2 = k
 
@@ -455,7 +849,6 @@ def transmission_finite_reflections(
     d_m: float,
     w: float,
     N_reflections: int,
-    c0_SI=299_792_458.0,
 ):
     """
     Parameters
@@ -479,7 +872,7 @@ def transmission_finite_reflections(
     if N_reflections < 0:
         raise ValueError("N_reflections must be >= 0")
     
-    wavelength_m = 2.0*np.pi * c0_SI / w
+    wavelength_m = 2.0*np.pi * C0_SI / w
 
     n1 = 1.0 + 0.0j
     n2 = complex(n, k)
@@ -528,7 +921,7 @@ def _make_window(name: str, N: int) -> np.ndarray:
     raise ValueError(f"Unknown window: {name!r}")
 
 
-def _fft_transfer_function(E_trans, E_inc, t_ax, d, pad_factor=1, window="hann", c0_SI=299_792_458.0):
+def _fft_transfer_function(E_trans, E_inc, t_ax, d, pad_factor=1, window="hann"):
     E_trans = np.asarray(E_trans, dtype=float)
     E_inc = np.asarray(E_inc, dtype=float)
     t_ax = np.asarray(t_ax, dtype=float)
@@ -556,7 +949,7 @@ def _fft_transfer_function(E_trans, E_inc, t_ax, d, pad_factor=1, window="hann",
     t_meas = np.conj(t_meas)
 
     # correct for vacuum removal
-    delta_phi = d*(2*np.pi*f)/c0_SI
+    delta_phi = d*(2*np.pi*f)/C0_SI
     t_meas *= np.exp(1.0j*delta_phi)
 
     return w, f, t_meas, Ei_w
@@ -567,7 +960,6 @@ def retrieve_nk_from_time_traces(
     E_incident,
     t_ax,
     d,
-    c0_SI=299_792_458.0,
     pad_factor=2,
     window="hann",
     inc_floor_rel=1e-4,
@@ -590,7 +982,7 @@ def retrieve_nk_from_time_traces(
     """
 
     w, f, t_meas, Ei_w = _fft_transfer_function(
-        E_transmitted, E_incident, t_ax, d, pad_factor=pad_factor, window=window, c0_SI=c0_SI
+        E_transmitted, E_incident, t_ax, d, pad_factor=pad_factor, window=window,
     )
 
     # Avoid dividing / fitting where the incident spectrum is tiny
@@ -624,13 +1016,13 @@ def retrieve_nk_from_time_traces(
         if num_reflections is not None:
             def fun(x):
                 ni, ki = x
-                t_mod = transmission_finite_reflections(ni, ki, d, wi, num_reflections, c0_SI=c0_SI)
+                t_mod = transmission_finite_reflections(ni, ki, d, wi, num_reflections)
                 r = t_mod - t_target
                 return np.abs(r)
         else:
             def fun(x):
                 ni, ki = x
-                t_mod = transmission_coeff_analytical(ni, ki, d, wi, c0_SI=c0_SI)
+                t_mod = transmission_coeff_analytical(ni, ki, d, wi)
                 r = t_mod - t_target
                 # return np.array([r.real, r.imag], dtype=float)
                 return np.abs(r)
@@ -650,9 +1042,9 @@ def retrieve_nk_from_time_traces(
         if res.success:
             n_fit[i], k_fit[i] = res.x
             if num_reflections is not None:
-                t_model_fit[i] = transmission_finite_reflections(res.x[0], res.x[1], d, wi, num_reflections, c0_SI=c0_SI)
+                t_model_fit[i] = transmission_finite_reflections(res.x[0], res.x[1], d, wi, num_reflections)
             else:
-                t_model_fit[i] = transmission_coeff_analytical(res.x[0], res.x[1], d, wi, c0_SI=c0_SI)
+                t_model_fit[i] = transmission_coeff_analytical(res.x[0], res.x[1], d, wi)
             x_prev = res.x  # continuation
         else:
             # keep previous guess but don't advance it aggressively
