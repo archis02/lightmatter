@@ -1,11 +1,10 @@
 from __future__ import annotations
 import numpy as np
 
-from .infer_drude_reflection import epsilon_drude
 from .io import load_simulation_run
 from .units import UNIT_T, UNIT_F, UNIT_L, C0_SI
-from .infer_drude_comp_const_interpolate import extract_peak_ratio_time_series_from_reflections as extract_peak_ratio_timeseries_interp
-from .infer_drude_comp_const import covariance_from_least_squares
+from .peak_analyzer_interpolate import extract_peak_ratio_time_series_from_reflections as extract_peak_ratio_timeseries_interp
+from .peak_analyzer_interpolate import covariance_from_least_squares,epsilon_drude
 
 from scipy.interpolate import interp1d
 from scipy.optimize import least_squares
