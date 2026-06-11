@@ -15,7 +15,7 @@ This repository is intended as a first-principles, classical electrodynamics san
 
 Ultrafast pump--probe experiments often measure changes in the reflected or transmitted electric field after a material has been driven out of equilibrium. A useful first description of the optical response is to treat the medium using a Drude--Lorentz dielectric function with time-dependent parameters,
 
-$$
+```math
 \varepsilon(\omega,t)
 =
 \varepsilon_{\infty}(t)
@@ -25,7 +25,7 @@ $$
 -
 \frac{\Delta\varepsilon(t)\Omega_L^2(t)}
 {\omega^2-\Omega_L^2(t)+i\Gamma_L(t)\omega}.
-$$
+```
 
 Here, the Drude plasma frequency `omega_D(t)` and damping rate `gamma_D(t)` encode the time-dependent free-carrier response, while the Lorentz oscillator parameters describe bound-electron resonances.
 
@@ -150,9 +150,9 @@ The FDTD solver uses normalized code units:
 
 For a stable vacuum Yee update, choose a Courant-like time step approximately satisfying:
 
-$$
+```math
 dt \lesssim \frac{dz}{C_0}.
-$$
+```
 
 ---
 
@@ -162,14 +162,14 @@ The inverse workflow starts by comparing a reflected waveform from a time-varyin
 
 `lightmatter` estimates the complex ratio
 
-$$
+```math
 R_\mathrm{meas}(t)
 =
 \frac{E_{\mathrm{refl,vary}}(t)}
      {E_{\mathrm{refl,const}}(t)}
 \approx
 A(t)\exp\left[i\omega_0\Delta t(t)\right].
-$$
+```
 
 The amplitude ratio `A(t)` is obtained from matched positive and negative extrema. The phase shift is obtained from linearly interpolated zero crossings associated with each matched extremum.
 
@@ -190,25 +190,25 @@ The higher-level inference routine compares multiple reflected-pulse simulations
 
 The Drude-only dielectric function used in the inverse model is
 
-$$
+```math
 \varepsilon_D(\omega,t)
 =
 \varepsilon_{\infty}
 -
 \frac{\omega_D^2(t)}
 {\omega\left[\omega+i\gamma_D(t)\right]}.
-$$
+```
 
 The inference model also includes a first-order time-derivative correction,
 
-$$
+```math
 n_\mathrm{eff}^2(\omega,t)
 =
 \varepsilon_D(\omega,t)
 -
 \frac{i}{\omega}
 \frac{\partial \varepsilon_D}{\partial t}.
-$$
+```
 
 The derivative is approximated from the fitted parameter change between consecutive time slices.
 
