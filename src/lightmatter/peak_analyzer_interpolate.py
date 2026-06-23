@@ -278,6 +278,8 @@ def extract_peak_ratio_time_series_from_reflections(
     E_refl_vary,
     t_ax,
     f0,
+    shift_delta=None,
+    time_choices=["zv","v","v"],
     peak_prom_frac=0.05,
     peak_tol_frac=0.45,
     zero_side="previous",
@@ -293,15 +295,16 @@ def extract_peak_ratio_time_series_from_reflections(
     The phase shift is obtained from matched zero crossings:
         dt_zero = t_zero_vary - t_zero_const
 
-    The zero-crossing delay is first measured at the zero-crossing midpoint time,
-        t_mid = 0.5 * (t_zero_const + t_zero_vary)
+    The final measured quantity is therefore evaluated after interpolation on a grid:
 
-    and then interpolated onto the reference-peak times,
-        t_peak_const = t_ax[accepted_ic]
+        ratio_meas = amp_ratio_interp * exp(i * omega0 * dt_zero_interp)
 
-    The final measured quantity is therefore evaluated on the peak-time grid:
+    time_choices: list of the form [char, char, char], determining choice of assignment of timestamps and final interpolation array.
 
-        ratio_meas = amp_ratio * exp(i * omega0 * dt_zero_at_peaks)
+        time_choices[0] can be in "zc","zm","zv","pc","pm","pv" (meaning same as below, but additionally of "z":zero or "p":peak)
+                    selects the final time axis on which they are interpolated to obtain the complex ratio array
+        time_choices[1] and [2] can be in "c", "m" or "v"; (meaning "c":constant, "m":mid, "v":vary)
+                    assigns the calculated zero-crossing shifts and peak ratios (respectively) to the chosen timestamps.
 
     Notes
     -----
@@ -467,7 +470,7 @@ def extract_peak_ratio_time_series_from_reflections(
     accepted_ic = np.asarray(accepted_ic, dtype=int)
     accepted_iv = np.asarray(accepted_iv, dtype=int)
 
-    t_mid = np.asarray(t_mid_list, dtype=float)
+    t_zero_mid = np.asarray(t_mid_list, dtype=float)
     amp_ratio = np.asarray(amp_ratio_list, dtype=float)
     dt_zero = np.asarray(dt_zero_list, dtype=float)
     dt_peak_raw = np.asarray(dt_peak_raw_list, dtype=float)
@@ -475,16 +478,40 @@ def extract_peak_ratio_time_series_from_reflections(
     t_zero_const = np.asarray(t_zero_const_list, dtype=float)
     t_zero_vary = np.asarray(t_zero_vary_list, dtype=float)
 
-    # output time base: reference-waveform peak times.
+    # output time base: reference-waveform peak times. # change this to mid
     t_peak_const = t_ax[accepted_ic]
+    t_peak_vary = t_ax[accepted_iv]
+    t_peak_mid = 0.5*(t_peak_const + t_peak_vary)
 
-    # phase-delay time base:
-    # interpolate zero-crossing delay from t_mid onto reference peak times.
-    dt_zero_at_peaks = _interp_linear_with_edge_extrap(
-        x_src=t_zero_const_list,
+    # Choose the final target time axis. This is the same for both ratio and zeros
+    target_dict = {"zv":t_zero_vary, "zm":t_zero_mid, "zc":t_zero_const, "pv":t_peak_vary, "pm":t_peak_mid, "pc":t_peak_const}
+    t_target = target_dict[time_choices[0]]
+
+    # Choose origin time axis (possibly distinct) for ratios and zeros
+    zero_dict = {"v":t_zero_vary, "m":t_zero_mid, "c":t_zero_const}
+    ratio_dict = {"v":t_peak_vary, "m":t_peak_mid, "c":t_peak_const}
+
+    # interpolate zero-crossing delay from chosen origin onto target times.
+    dt_zero_interp = _interp_linear_with_edge_extrap(
+        x_src=zero_dict[time_choices[1]], # origin
         y_src=dt_zero,
-        x_dst=t_peak_const,
+        x_dst=t_target, # target
     )
+
+    # interpolate peak ratio from chosen origin onto target times.
+    amp_ratio_interp = _interp_linear_with_edge_extrap(
+        x_src=ratio_dict[time_choices[2]], # origin
+        y_src=amp_ratio,
+        x_dst=t_target, # target
+    )
+
+    # add the option of a shifted amp_ratio
+    if shift_delta is not None:
+        amp_ratio_shifted = _interp_linear_with_edge_extrap(
+            x_src=t_peak_const,
+            y_src=amp_ratio,
+            x_dst=t_zero_const + shift_delta,
+        )
 
     # 5. Clip rising/falling edge samples after zero-crossing filtering.
     if clip > 0 and len(t_peak_const) > 2 * clip:
@@ -493,25 +520,33 @@ def extract_peak_ratio_time_series_from_reflections(
         accepted_ic = accepted_ic[sl]
         accepted_iv = accepted_iv[sl]
 
-        t_mid = t_mid[sl]
+        t_zero_mid = t_zero_mid[sl]
         t_peak_const = t_peak_const[sl]
+        t_peak_vary = t_peak_vary[sl]
 
         amp_ratio = amp_ratio[sl]
+        amp_ratio_interp = amp_ratio_interp[sl]
 
-        # dt_zero is the original zero-crossing delay sampled at t_mid.
-        # dt_zero_at_peaks is the interpolated delay sampled at t_peak_const.
+        if shift_delta is not None:
+            amp_ratio_shifted = amp_ratio_shifted[sl]
+
         dt_zero = dt_zero[sl]
-        dt_zero_at_peaks = dt_zero_at_peaks[sl]
-
+        dt_zero_interp = dt_zero_interp[sl]
         dt_peak_raw = dt_peak_raw[sl]
 
         t_zero_const = t_zero_const[sl]
         t_zero_vary = t_zero_vary[sl]
+        t_target = t_target[sl]
 
         matched_zero_pairs = matched_zero_pairs[clip:-clip]
 
     # 6. Use peak-time-interpolated zero-crossing delay for the phase.
-    ratio_complex = amp_ratio * np.exp(1.0j * omega0 * dt_zero_at_peaks)
+    # Or we can do the converse, interpolate the peak ratios to the zero-crossing times
+    # ratio_complex = amp_ratio * np.exp(1.0j * omega0 * dt_zero_at_peaks)
+    if shift_delta is not None:
+        ratio_complex = amp_ratio_shifted * np.exp(1.0j * omega0 * dt_zero)
+    else:
+        ratio_complex = amp_ratio_interp * np.exp(1.0j * omega0 * dt_zero_interp)
 
     aux = {
         "matched_peak_pairs": list(zip(accepted_ic.tolist(), accepted_iv.tolist())),
@@ -530,26 +565,15 @@ def extract_peak_ratio_time_series_from_reflections(
 
         "t_zero_const": t_zero_const,
         "t_zero_vary": t_zero_vary,
-
-        # Original zero-crossing midpoint time base.
-        "t_mid": t_mid,
-
-        # New returned time base.
         "t_peak_const": t_peak_const,
+        "t_peak_vary":t_peak_vary,
 
-        # Delay sampled at zero-crossing midpoint times.
         "dt_zero": dt_zero,
-
-        # Delay interpolated onto reference-peak times.
-        "dt_zero_at_peaks": dt_zero_at_peaks,
-
-        # Raw peak-to-peak delay, kept only as a diagnostic.
         "dt_peak_raw": dt_peak_raw,
-
         "amp_ratio": amp_ratio,
     }
 
-    return t_peak_const, ratio_complex, aux
+    return t_target, ratio_complex, aux
 
 
 def covariance_from_least_squares(res):
