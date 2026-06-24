@@ -4,8 +4,6 @@ import numpy as np
 from .io import load_simulation_run
 from .units import UNIT_T, UNIT_F, UNIT_L
 
-from scipy.interpolate import interp1d
-from scipy.optimize import least_squares
 from scipy.signal import find_peaks
 
 def epsilon_drude(omega, eps_inf, omega_D, gamma_D):
@@ -279,7 +277,7 @@ def extract_peak_ratio_time_series_from_reflections(
     t_ax,
     f0,
     shift_delta=None,
-    time_choices=["zv","v","v"],
+    time_choices=["zm","m","m"],
     peak_prom_frac=0.05,
     peak_tol_frac=0.45,
     zero_side="previous",

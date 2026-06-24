@@ -703,8 +703,6 @@ def infer_drude_time_series_from_multifrequency_runs(
 
     omegaD_err = np.full(Nt, np.nan, dtype=float)
     gammaD_err = np.full(Nt, np.nan, dtype=float)
-    # del_omegaD_del_t_err = np.full(Nt, np.nan, dtype=float)
-    # del_gammaD_del_t_err = np.full(Nt, np.nan, dtype=float)
 
     cost_t = np.empty(Nt, dtype=float)
     success_t = np.empty(Nt, dtype=bool)
@@ -742,10 +740,6 @@ def infer_drude_time_series_from_multifrequency_runs(
                 omegaD_err[k] = np.sqrt(cov[0, 0])
             if cov[1, 1] >= 0:
                 gammaD_err[k] = np.sqrt(cov[1, 1])
-            # if cov[2, 2] >= 0:
-            #     del_omegaD_del_t_err[k] = np.sqrt(cov[2, 2])
-            # if cov[3, 3] >= 0:
-            #     del_gammaD_del_t_err[k] = np.sqrt(cov[3, 3])
 
         x_prev = np.array([fitk["omega_D"], fitk["gamma_D"]], dtype=float)
 
@@ -759,8 +753,6 @@ def infer_drude_time_series_from_multifrequency_runs(
         "del_gammaD_del_t": del_gammaD_del_t,
         "omegaD_err": omegaD_err,
         "gammaD_err": gammaD_err,
-        # "del_omegaD_del_t_err": del_gammaD_del_t_err,
-        # "del_gammaD_del_t_err": del_gammaD_del_t_err,
         "cost_t": cost_t,
         "success_t": success_t,
         "fit_objects": fit_objects,
