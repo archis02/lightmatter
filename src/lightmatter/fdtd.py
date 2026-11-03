@@ -363,202 +363,6 @@ def run_fdtd_convolution(
 
 
 @njit(parallel=True)
-def run_fdtd_exact(
-    Nz, Nt, dz, dt,
-    src_i,                       # source cell index
-    probe_t_i,                   # transmitted probe index
-    probe_r_i,                   # reflected probe index
-    metal_i0, metal_i1,          # metal region [i0, i1)
-    omega_D, gamma_D, omega_L, gamma_L, del_eps, eps_inf,   # time-dependent arrays
-    E0, f0, t0, tau, phase, pulsetype,                      # source waveform params
-    bE, cE, bH, cH,                                         # PML coefficients
-    snap_every=20
-):
-    """
-    1D Yee FDTD with PML and a genuinely time-dependent Drude-Lorentz medium.
-
-    This version removes the adiabatic recursive-convolution update and instead
-    advances the material dynamics directly:
-
-        dJ_D/dt + gamma_D(t) J_D = omega_D(t)^2 E
-        dP_L/dt = J_L
-        dJ_L/dt + gamma_L(t) J_L + omega_L(t)^2 P_L
-            = del_eps(t) * omega_L(t)^2 * E
-
-    together with Ampere's law in normalized form
-
-        d/dt [eps_inf(t) E + P_L] + J_D = d(H/eps0)/dz .
-
-    Here J_D, J_L, P_L are understood as polarization/current variables divided
-    by eps0, consistent with the H_by_eps0 convention already used in this file.
-    """
-
-    # -------------------------
-    # Fields / material states
-    # -------------------------
-    E = np.zeros(Nz, dtype=np.float64)
-    E_old = np.zeros(Nz, dtype=np.float64)
-
-    H_by_eps0 = np.zeros(Nz - 1, dtype=np.float64)   # H / eps0 on Yee edges
-
-    # Drude current (stored at half steps conceptually; numerically advanced in place)
-    J_D = np.zeros(Nz, dtype=np.float64)
-
-    # Lorentz polarization and Lorentz current
-    P_L = np.zeros(Nz, dtype=np.float64)
-    J_L = np.zeros(Nz, dtype=np.float64)
-
-    # -------------------------
-    # Probes
-    # -------------------------
-    E_t = np.zeros(Nt, dtype=np.float64)
-    E_r = np.zeros(Nt, dtype=np.float64)
-
-    # -------------------------
-    # Snapshot storage
-    # -------------------------
-    if snap_every > 0:
-        nsnaps = (Nt + snap_every - 1) // snap_every
-        snaps_E = np.zeros((nsnaps, Nz), dtype=np.float64)
-        snaps_t = np.zeros(nsnaps, dtype=np.float64)
-    else:
-        snaps_E = np.zeros((1, 1), dtype=np.float64)
-        snaps_t = np.zeros(1, dtype=np.float64)
-    snap_k = 0
-
-    # -------------------------
-    # Time stepping
-    # -------------------------
-    for n in range(Nt):
-        t = n * dt
-
-        # Save E^n, because all updates below use the old electric field
-        for i in prange(Nz):
-            E_old[i] = E[i]
-
-        # -------------------------
-        # Update H^{n+1/2} from E^n
-        # -------------------------
-        for i in prange(Nz - 1):
-            H_by_eps0[i] = bH[i] * H_by_eps0[i] - cH[i] * (E_old[i + 1] - E_old[i])
-
-        # Time-slab sampling.
-        # Using midpoint-like averages improves robustness for fast parameter changes.
-        np1 = n + 1
-        if np1 >= Nt:
-            np1 = n
-
-        # -------------------------
-        # Update E^{n+1}
-        # -------------------------
-        for i in prange(1, Nz - 1):
-            curlH = -H_by_eps0[i] + H_by_eps0[i - 1]
-
-            # Dispersive material region
-            if metal_i0 <= i < metal_i1:
-                # Midpoint-sampled material coefficients on the time slab [t_n, t_{n+1}]
-                gD = 0.5 * (gamma_D[n] + gamma_D[np1])
-                wD2 = 0.5 * (
-                    omega_D[n] * omega_D[n] +
-                    omega_D[np1] * omega_D[np1]
-                )
-
-                gL = 0.5 * (gamma_L[n] + gamma_L[np1])
-                wL2 = 0.5 * (
-                    omega_L[n] * omega_L[n] +
-                    omega_L[np1] * omega_L[np1]
-                )
-                sL = 0.5 * (
-                    del_eps[n] * omega_L[n] * omega_L[n] +
-                    del_eps[np1] * omega_L[np1] * omega_L[np1]
-                )
-
-                eps_n = eps_inf[n]
-                eps_np1 = eps_inf[np1]
-
-                # ---- Drude current update
-                # Crank-Nicolson for damping, explicit in E^n
-                #
-                # (J_D^{n+1/2} - J_D^{n-1/2})/dt
-                #   + gD * (J_D^{n+1/2} + J_D^{n-1/2})/2
-                #   = wD2 * E^n
-                denom_D = 1.0 + 0.5 * gD * dt
-                JD_np12 = (
-                    (1.0 - 0.5 * gD * dt) * J_D[i]
-                    + dt * wD2 * E_old[i]
-                ) / denom_D
-
-                # ---- Lorentz update
-                # First-order form:
-                #   dP_L/dt = J_L
-                #   dJ_L/dt + gL J_L + wL2 P_L = sL E
-                #
-                # Semi-implicit/staggered update:
-                denom_L = 1.0 + 0.5 * gL * dt + 0.5 * wL2 * dt * dt
-                JL_np12 = (
-                    (1.0 - 0.5 * gL * dt) * J_L[i]
-                    - dt * wL2 * P_L[i]
-                    + dt * sL * E_old[i]
-                ) / denom_L
-                PL_np1 = P_L[i] + dt * JL_np12
-
-                # ---- Ampere update with time-dependent eps_inf
-                #
-                # [eps_inf^{n+1} E^{n+1} - eps_inf^n E^n]/dt
-                #   + J_D^{n+1/2} + J_L^{n+1/2}
-                #   = curlH / dz
-                E[i] = (
-                    eps_n * E_old[i]
-                    + (dt / dz) * curlH
-                    - dt * (JD_np12 + JL_np12)
-                ) / eps_np1
-
-                # Commit updated material states
-                J_D[i] = JD_np12
-                J_L[i] = JL_np12
-                P_L[i] = PL_np1
-
-            else:
-                # Vacuum / non-dispersive region with precomputed PML coefficients
-                E[i] = bE[i] * E_old[i] + cE[i] * curlH
-
-        # -------------------------
-        # Soft source injection
-        # -------------------------
-        if pulsetype == "gaussian":
-            E[src_i] += gaussian_sine(t, E0, f0, t0, tau, phase)
-        elif pulsetype == "boxed" or pulsetype == "box":
-            E[src_i] += boxed_pulse(t, E0, f0, t0, tau, phase)
-        elif pulsetype == "smoothed box":
-            E[src_i] += smooth_boxed_pulse(t, E0, f0, t0, tau, phase)
-        else:
-            raise ValueError("invalid pulse name")
-
-        # -------------------------
-        # Boundary E update
-        # -------------------------
-        E[0] = bE[0] * E[0] - cE[0] * (H_by_eps0[0] - 0.0)
-        E[Nz - 1] = bE[Nz - 1] * E[Nz - 1] - cE[Nz - 1] * (0.0 - H_by_eps0[Nz - 2])
-
-        # -------------------------
-        # Record probes
-        # -------------------------
-        E_t[n] = E[probe_t_i]
-        E_r[n] = E[probe_r_i]
-
-        # -------------------------
-        # Snapshots
-        # -------------------------
-        if snap_every > 0 and (n % snap_every == 0):
-            snaps_t[snap_k] = t
-            for i in range(Nz):
-                snaps_E[snap_k, i] = E[i]
-            snap_k += 1
-
-    return E_t, E_r, snaps_t, snaps_E
-
-
-@njit(parallel=True)
 def run_fdtd_pml_corrected(
     Nz, Nt, dz, dt,
     src_i,
@@ -569,7 +373,8 @@ def run_fdtd_pml_corrected(
     E0, f0, t0, tau, phase, pulsetype,
     sigmaE_by_eps0,            # NEW
     bH, cH,                    # only H PML coeffs are needed explicitly
-    snap_every=200
+    snap_every=200,
+    explicit_pulse_waveform = None # callable, usually would be externally an interp function
 ):
     """
     1D Yee FDTD with conductivity-graded absorber overlapping a genuinely
@@ -721,6 +526,12 @@ def run_fdtd_pml_corrected(
             E[src_i] += boxed_pulse(t, E0, f0, t0, tau, phase)
         elif pulsetype == "smoothed box":
             E[src_i] += smooth_boxed_pulse(t, E0, f0, t0, tau, phase)
+        # add another type
+        elif pulsetype == "explicit":
+            if explicit_pulse_waveform is None:
+                raise ValueError("Supplied waveform is None for explicit mode")
+            else:
+                E[src_i] += explicit_pulse_waveform(t)
         else:
             raise ValueError("invalid pulse name")
 
@@ -742,14 +553,260 @@ def run_fdtd_pml_corrected(
     return E_t, E_r, snaps_t, snaps_E
 
 
+def check_fdtd_pulse_transition_consistency(
+    *,
+    params,
+    pulse,
+    material,
+    # src_i,
+    # probe_r_i,
+    # metal_i0,
+    # dz,
+    # transition_center,
+    # transition_time,
+    # f0,
+    transition_half_width_factor=1.0,
+    min_guard_cycles=5,
+    verbose=True,
+):
+    """
+    Consistency checks for a 1D FDTD reflection simulation with a smooth boxed pulse
+    and a step-like Drude-parameter transition.
+
+    Parameters
+    ----------
+    src_i, probe_r_i, metal_i0 : int
+        Source, reflection-probe, and metal-interface indices.
+
+    dz : float
+        Grid spacing in Angstrom.
+
+    C0 : float
+        Speed of light in simulation units, usually Angstrom / ps.
+
+    pulse : PulseParams
+        Pulse object with fields t0 and tau in ps.
+
+    transition_center : float
+        Center time of Drude transition in ps.
+
+    transition_time : float
+        Transition time scale in ps. For your tanh profile this is the `deltat`
+        parameter in tanh((t - t0) / deltat).
+
+    f0 : float
+        Carrier frequency in THz. Since 1 THz = 1 / ps, the carrier period is 1/f0 ps.
+
+    transition_half_width_factor : float
+        Defines the effective transition window as:
+            transition_center +/- transition_half_width_factor * transition_time
+
+        Use 1.0 if you want the same window as your fitting MSE calculation.
+        Use 2.0 for a stricter tanh-transition window.
+
+    min_guard_cycles : int
+        Number of optical cycles desired on both sides of the transition window
+        inside the flat part of the pulse.
+
+    verbose : bool
+        If True, prints diagnostic information and warnings.
+
+    Returns
+    -------
+    checks : dict
+        Dictionary containing derived timing windows and Boolean pass/fail flags.
+    """
+
+    warnings_list = []
+
+    # -------------------------------------------------------------------------
+    # Pulse timing at the source
+    # -------------------------------------------------------------------------
+    tau = pulse.tau
+    t0_src = pulse.t0
+
+    pulse_support_duration = 2.0 * tau
+
+    tramp = 0.1 * 2.0 * tau
+    flat_half_width = tau - tramp
+    flat_duration = 2.0 * flat_half_width
+
+    # -------------------------------------------------------------------------
+    # Propagation time from source to metal
+    # -------------------------------------------------------------------------
+    src_to_metal_dist = (metal_i0 - src_i) * dz
+    src_to_metal_time = src_to_metal_dist / C0
+
+    pulse_center_at_metal = t0_src + src_to_metal_time
+
+    pulse_start_at_metal = pulse_center_at_metal - tau
+    pulse_end_at_metal = pulse_center_at_metal + tau
+
+    flat_start_at_metal = pulse_center_at_metal - flat_half_width
+    flat_end_at_metal = pulse_center_at_metal + flat_half_width
+
+    # -------------------------------------------------------------------------
+    # Effective Drude-transition window
+    # -------------------------------------------------------------------------
+    transition_start = transition_center - transition_half_width_factor * transition_time
+    transition_end = transition_center + transition_half_width_factor * transition_time
+    transition_effective_duration = transition_end - transition_start
+
+    optical_period = 1.0 / f0
+    guard_time = min_guard_cycles * optical_period
+
+    guarded_transition_start = transition_start - guard_time
+    guarded_transition_end = transition_end + guard_time
+
+    # -------------------------------------------------------------------------
+    # Check 1: pulse must be sufficiently long
+    # -------------------------------------------------------------------------
+    required_flat_duration = transition_effective_duration + 2.0 * guard_time
+
+    pulse_long_enough = flat_duration >= required_flat_duration
+
+    if not pulse_long_enough:
+        warnings_list.append(
+            "Pulse flat-top is too short for the requested transition window. "
+            f"Flat-top duration = {flat_duration * 1e3:.3f} fs, "
+            f"required duration = {required_flat_duration * 1e3:.3f} fs. "
+            "Increase tau, reduce the transition-time window, or reduce min_guard_cycles."
+        )
+
+    # -------------------------------------------------------------------------
+    # Check 2: transition should happen while pulse is reflecting from metal
+    # -------------------------------------------------------------------------
+    transition_inside_pulse_support = (
+        transition_start >= pulse_start_at_metal
+        and transition_end <= pulse_end_at_metal
+    )
+
+    if not transition_inside_pulse_support:
+        warnings_list.append(
+            "The Drude transition does not fully occur while the pulse is incident "
+            "on the metal surface. "
+            f"Transition window = [{transition_start * 1e3:.3f}, "
+            f"{transition_end * 1e3:.3f}] fs, "
+            f"pulse-at-metal support = [{pulse_start_at_metal * 1e3:.3f}, "
+            f"{pulse_end_at_metal * 1e3:.3f}] fs."
+        )
+
+    transition_inside_flat_top = (
+        guarded_transition_start >= flat_start_at_metal
+        and guarded_transition_end <= flat_end_at_metal
+    )
+
+    if not transition_inside_flat_top:
+        warnings_list.append(
+            "The guarded Drude-transition window is not fully inside the flat-top "
+            "of the pulse at the metal. "
+            f"Guarded transition window = [{guarded_transition_start * 1e3:.3f}, "
+            f"{guarded_transition_end * 1e3:.3f}] fs, "
+            f"flat-top-at-metal window = [{flat_start_at_metal * 1e3:.3f}, "
+            f"{flat_end_at_metal * 1e3:.3f}] fs. "
+            "This means the inferred response may mix true material dynamics with "
+            "pulse-envelope effects."
+        )
+
+    # -------------------------------------------------------------------------
+    # Check 3: reflected and incident pulses should not overlap at reflection probe
+    # -------------------------------------------------------------------------
+    probe_to_metal_dist = (metal_i0 - probe_r_i) * dz
+
+    min_probe_to_metal_dist = 0.5 * pulse_support_duration * C0
+
+    probe_separation_ok = probe_to_metal_dist > min_probe_to_metal_dist
+
+    if not probe_separation_ok:
+        warnings_list.append(
+            "Reflection probe is too close to the metal surface. Incident and "
+            "reflected pulses may overlap at the probe. "
+            f"Probe-metal distance = {probe_to_metal_dist:.3e} A, "
+            f"minimum recommended distance = {min_probe_to_metal_dist:.3e} A. "
+            "Move probe_r farther left from the metal interface or shorten the pulse."
+        )
+
+    checks = {
+        "pulse_support_duration_ps": pulse_support_duration,
+        "pulse_flat_duration_ps": flat_duration,
+        "optical_period_ps": optical_period,
+        "guard_time_ps": guard_time,
+        "required_flat_duration_ps": required_flat_duration,
+        "pulse_center_at_metal_ps": pulse_center_at_metal,
+        "pulse_start_at_metal_ps": pulse_start_at_metal,
+        "pulse_end_at_metal_ps": pulse_end_at_metal,
+        "flat_start_at_metal_ps": flat_start_at_metal,
+        "flat_end_at_metal_ps": flat_end_at_metal,
+        "transition_start_ps": transition_start,
+        "transition_end_ps": transition_end,
+        "guarded_transition_start_ps": guarded_transition_start,
+        "guarded_transition_end_ps": guarded_transition_end,
+        "probe_to_metal_distance_A": probe_to_metal_dist,
+        "minimum_probe_to_metal_distance_A": min_probe_to_metal_dist,
+        "pulse_long_enough": pulse_long_enough,
+        "transition_inside_pulse_support": transition_inside_pulse_support,
+        "transition_inside_flat_top": transition_inside_flat_top,
+        "probe_separation_ok": probe_separation_ok,
+        "passed_all_checks": (
+            pulse_long_enough
+            and transition_inside_pulse_support
+            and transition_inside_flat_top
+            and probe_separation_ok
+        ),
+        "warnings": warnings_list,
+    }
+
+    if verbose:
+        print("\nFDTD pulse/transition consistency check")
+        print("---------------------------------------")
+        print(f"Pulse center at source      : {t0_src * 1e3:.3f} fs")
+        print(f"Pulse center at metal       : {pulse_center_at_metal * 1e3:.3f} fs")
+        print(
+            f"Pulse support at metal      : "
+            f"{pulse_start_at_metal * 1e3:.3f} fs to "
+            f"{pulse_end_at_metal * 1e3:.3f} fs"
+        )
+        print(
+            f"Pulse flat-top at metal     : "
+            f"{flat_start_at_metal * 1e3:.3f} fs to "
+            f"{flat_end_at_metal * 1e3:.3f} fs"
+        )
+        print(
+            f"Transition window           : "
+            f"{transition_start * 1e3:.3f} fs to "
+            f"{transition_end * 1e3:.3f} fs"
+        )
+        print(
+            f"Guarded transition window   : "
+            f"{guarded_transition_start * 1e3:.3f} fs to "
+            f"{guarded_transition_end * 1e3:.3f} fs"
+        )
+        print(f"Pulse support duration      : {pulse_support_duration * 1e3:.3f} fs")
+        print(f"Pulse flat-top duration     : {flat_duration * 1e3:.3f} fs")
+        print(f"Required flat-top duration  : {required_flat_duration * 1e3:.3f} fs")
+        print(f"Optical period              : {optical_period * 1e3:.3f} fs")
+        print(f"Guard time                  : {guard_time * 1e3:.3f} fs")
+        print(f"Probe-metal distance        : {probe_to_metal_dist:.3e} A")
+        print(f"Minimum recommended distance: {min_probe_to_metal_dist:.3e} A")
+
+        if len(warnings_list) == 0:
+            print("\nAll consistency checks passed.")
+        else:
+            print("\nWarnings:")
+            for warning in warnings_list:
+                print(f"[WARNING] {warning}")
+
+    return checks
+
+
 def run_simulation(
     params: FDTDParams,
     pulse: PulseParams,
     material: MaterialParamsTD,
     method = "convolution"
 ):
-    if method not in ["convolution", "exact", "exact pml"]:
-        raise ValueError("Unknown method; must be \'convolution\' or \'exact\' or \'exact pml\'")
+    if method not in ["convolution", "exact pml"]:
+        raise ValueError("Unknown method; must be \'convolution\' or \'exact pml\'")
     
     bE, cE, bH, cH, sigmaEbyEpsZero = build_pml_1d(
         Nz=params.Nz,
@@ -759,22 +816,9 @@ def run_simulation(
         R_target=params.R_target,
         m=params.m,
     )
-    print(f"Maximum correction: {0.5 * sigmaEbyEpsZero[-1] * params.dt}")
 
     if method=="convolution":
         return run_fdtd_convolution(
-            params.Nz, params.Nt, params.dz, params.dt,
-            params.src_i, params.probe_t_i, params.probe_r_i,
-            params.metal_i0, params.metal_i1,
-            material.omega_D, material.gamma_D,
-            material.omega_L, material.gamma_L,
-            material.del_eps, material.eps_inf,
-            pulse.E0, pulse.f0, pulse.t0, pulse.tau, pulse.phase, pulse.type,
-            bE, cE, bH, cH,
-            params.snap_every,
-        )
-    elif method=="exact":
-        return run_fdtd_exact(
             params.Nz, params.Nt, params.dz, params.dt,
             params.src_i, params.probe_t_i, params.probe_r_i,
             params.metal_i0, params.metal_i1,

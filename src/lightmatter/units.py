@@ -18,5 +18,5 @@ C0_SI: Final[float] = 299_792_458.0
 
 # these are not required normally, recheck if you are uncommenting this!
 # mu0 = 4e-7 * np.pi
-# eps0 = 1.0 / (mu0 * c0**2)
+# eps0 = 1.0 / (mu0 * C0**2)
 # Z0 = np.sqrt(mu0 / eps0)

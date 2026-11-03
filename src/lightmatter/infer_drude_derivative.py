@@ -26,6 +26,7 @@ def drude_delta_reflection_residual_with_derivative(
     weights=None,
     lam_smooth=0.0,
     x_prev=None,
+    no_approximation=False,
     floor=1e-5,
 ):
     """
@@ -55,19 +56,35 @@ def drude_delta_reflection_residual_with_derivative(
         gamma_D=gamma_D
     )
 
-    n_sqr = eps_drude - 1.0j/omega_arr * del_eps_del_t
+    if no_approximation: #---------------------## This only works for the static case, since no time-derivative is included in this calculation
+        n_static = np.sqrt(eps_drude)
+        delta_omega = omega_arr * n_static * d_m / C0_SI
+        t_complex_vary = 1.0 / ( np.cos(delta_omega)  - 0.5j * (n_static + 1./n_static) * np.sin(delta_omega))
+        r_complex_vary = 0.5j * (n_static - 1.0/n_static) * np.sin(delta_omega) * t_complex_vary
 
-    t_complex_vary = 1.0 + 1.0j * omega_arr * d_m / (2.0 * C0_SI) * (1.0 + n_sqr)
-    r_complex_vary = (0.5j*omega_arr*d_m / C0_SI)*(n_sqr - 1.0) * t_complex_vary
+        eps_drude_const = epsilon_drude(omega_arr, eps_inf=eps_inf, omega_D=omega_D0, gamma_D=gamma_D0, )
+        n_static_const = np.sqrt(eps_drude_const)
+        delta_omega_const = omega_arr * n_static_const * d_m / C0_SI
+        t_complex_const = 1.0 / ( np.cos(delta_omega_const)  - 0.5j * (n_static_const + 1./n_static_const) * np.sin(delta_omega_const))
+        r_complex_const = 0.5j * (n_static_const - 1.0/n_static_const) * np.sin(delta_omega_const) * t_complex_const
 
-    eps_drude_const = epsilon_drude(omega_arr, eps_inf=eps_inf, omega_D=omega_D0, gamma_D=gamma_D0, )
-    t_complex_const = 1.0 + 1.0j * omega_arr * d_m / (2.0 * C0_SI) * (1.0 + eps_drude_const)
-    r_complex_const = (0.5j*omega_arr*d_m / C0_SI)*(eps_drude_const - 1.0) * t_complex_const
+    else:
+        n_sqr = eps_drude - 1.0j/omega_arr * del_eps_del_t
+
+        t_complex_vary = 1.0 + 1.0j * omega_arr * d_m / (2.0 * C0_SI) * (1.0 + n_sqr)
+        r_complex_vary = (0.5j*omega_arr*d_m / C0_SI)*(n_sqr - 1.0) * t_complex_vary
+
+        eps_drude_const = epsilon_drude(omega_arr, eps_inf=eps_inf, omega_D=omega_D0, gamma_D=gamma_D0, )
+        t_complex_const = 1.0 + 1.0j * omega_arr * d_m / (2.0 * C0_SI) * (1.0 + eps_drude_const)
+        r_complex_const = (0.5j*omega_arr*d_m / C0_SI)*(eps_drude_const - 1.0) * t_complex_const
 
     ratio_model = r_complex_vary / r_complex_const
     
-    diff_angle = np.unwrap(np.angle(ratio_model)) - np.unwrap(np.angle(ratio_r_meas_arr))
-    diff_abs = np.abs(ratio_model) - np.abs(ratio_r_meas_arr)
+    diff_angle = np.abs(np.unwrap(np.angle(ratio_model)) - np.unwrap(np.angle(ratio_r_meas_arr)))
+    diff_abs = np.abs(np.abs(ratio_model) - np.abs(ratio_r_meas_arr))
+
+    # diff_angle = np.unwrap(np.angle(ratio_model)) - np.unwrap(np.angle(ratio_r_meas_arr))
+    # diff_abs = np.abs(ratio_model) - np.abs(ratio_r_meas_arr)
 
     scale_abs = np.maximum(np.abs(ratio_r_meas_arr), floor)
     scale_angle = np.maximum(np.abs(np.angle(ratio_r_meas_arr)), floor)
@@ -154,7 +171,7 @@ def build_multifrequency_reflection_dataset(
     common_time=None,
     common_time_sampling="highest",
     kind="linear",
-    clip=2,
+    clip=(2,2),
 ):
     """
     Build ratio_meas(omega_j, t_k) from matched peaks of reflected-only traces.
@@ -227,7 +244,7 @@ def build_multifrequency_reflection_dataset(
     kind : str, optional
         Interpolation type passed to ``scipy.interpolate.interp1d``.
 
-    clip : int, optional
+    clip : list, optional
         Number of matched samples removed at each end by the peak-extraction
         function.
 

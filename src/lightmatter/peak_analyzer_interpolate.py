@@ -1,4 +1,5 @@
 from __future__ import annotations
+import warnings
 import numpy as np
 
 from .io import load_simulation_run
@@ -10,7 +11,16 @@ def epsilon_drude(omega, eps_inf, omega_D, gamma_D):
     omega = np.asarray(omega, dtype=float)
     return eps_inf - omega_D**2.0 / (omega * (omega + 1.0j * gamma_D))
 
-def _signed_peaks(x, t, f0, peak_prom_frac=0.05, min_dist_frac=0.35):
+def epsilon_drudelorentz(omega, eps_inf, omega_D, gamma_D, del_eps, omega_L, gamma_L):
+
+    omega = np.asarray(omega, dtype=float)
+
+    eps_drude = eps_inf - omega_D**2.0 / (omega * (omega + 1.0j * gamma_D))
+    eps_lorentz = -1.0 * del_eps * omega_L**2.0 / ((omega**2.0 - omega_L**2.0) + 1.0j*gamma_L*omega )
+
+    return eps_drude + eps_lorentz
+
+def _signed_peaks(x, t, f0, peak_prom_threshold, min_dist_frac=0.5):
     """
     Find both positive and negative extrema and return them in time order.
 
@@ -31,10 +41,9 @@ def _signed_peaks(x, t, f0, peak_prom_frac=0.05, min_dist_frac=0.35):
     T0 = 1.0 / f0
 
     min_dist = max(1, int(np.ceil(min_dist_frac * T0 / dt)))
-    prom = peak_prom_frac * np.max(np.abs(x))
 
-    idx_pos, _ = find_peaks(x, prominence=prom, distance=min_dist)
-    idx_neg, _ = find_peaks(-x, prominence=prom, distance=min_dist)
+    idx_pos, _ = find_peaks(x, prominence=peak_prom_threshold, distance=min_dist)
+    idx_neg, _ = find_peaks(-x, prominence=peak_prom_threshold, distance=min_dist)
 
     idx = np.r_[idx_pos, idx_neg]
     sgn = np.r_[np.ones(len(idx_pos), dtype=int), -np.ones(len(idx_neg), dtype=int)]
@@ -42,6 +51,47 @@ def _signed_peaks(x, t, f0, peak_prom_frac=0.05, min_dist_frac=0.35):
     order = np.argsort(idx)
     return idx[order], sgn[order]
 
+
+# def _match_signed_peaks(idx_const, sgn_const, idx_vary, sgn_vary, t, tol):
+#     """
+#     Monotonic one-to-one matching of extrema with the same sign.
+
+#     Parameters
+#     ----------
+#     tol : float
+#         Maximum allowed time mismatch.
+#     """
+#     matched = []
+#     j0 = 0
+
+#     t_const = t[idx_const]
+#     t_vary = t[idx_vary]
+
+#     # loop over each peak in the const class
+#     for ic, sc, tc in zip(idx_const, sgn_const, t_const):
+
+#         # take pointer to within tolerance-distance of peak
+#         while j0 < len(idx_vary) and t_vary[j0] < tc - tol:
+#             j0 += 1
+
+#         # identify candidates
+#         candidates = []
+#         for jj in (j0 - 1, j0, j0 + 1, j0 + 2, j0 + 3):
+#             if 0 <= jj < len(idx_vary):
+#                 if sgn_vary[jj] == sc and abs(t_vary[jj] - tc) <= tol:
+#                     candidates.append(jj)
+
+#         if not candidates:
+#             continue
+
+#         # Modify this
+#         # pick best candidate that is not already assigned, and show a message / warning if a peak couldn't be assigned
+#         jj_best = min(candidates, key=lambda jj: abs(t_vary[jj] - tc))
+#         matched.append((ic, idx_vary[jj_best]))
+
+#         j0 = jj_best + 1
+
+#     return matched
 
 def _match_signed_peaks(idx_const, sgn_const, idx_vary, sgn_vary, t, tol):
     """
@@ -53,27 +103,64 @@ def _match_signed_peaks(idx_const, sgn_const, idx_vary, sgn_vary, t, tol):
         Maximum allowed time mismatch.
     """
     matched = []
+    used_vary = set()
     j0 = 0
 
     t_const = t[idx_const]
     t_vary = t[idx_vary]
 
+    #debug
+    # print(f"vary 0 {t_vary[0]}, const 0 {t_const[0]}")
+
+    # Loop over each peak in the const waveform.
     for ic, sc, tc in zip(idx_const, sgn_const, t_const):
+
+        # Move pointer to within tolerance distance of current const peak.
         while j0 < len(idx_vary) and t_vary[j0] < tc - tol:
             j0 += 1
 
+        # Identify possible candidates.
         candidates = []
-        for jj in (j0 - 1, j0, j0 + 1, j0 + 2):
+
+        for jj in (j0 - 1, j0, j0 + 1, j0 + 2,):
             if 0 <= jj < len(idx_vary):
-                if sgn_vary[jj] == sc and abs(t_vary[jj] - tc) <= tol:
+
+                #debug
+                # if jj==0:
+                #     print(f"signmatch jj {sgn_vary[jj]} sc {sc} ")
+
+                if (
+                    sgn_vary[jj] == sc
+                    and abs(t_vary[jj] - tc) <= tol
+                    and jj not in used_vary
+                ):
                     candidates.append(jj)
 
+        # # debug
+        # if j0<=5:
+        #     print(f" jo: {j0}, candidates : {candidates}, tc : {tc}")
+        # break 
+
+        # No unused compatible candidate could be found.
         if not candidates:
+            warnings.warn(
+                f"Could not assign const peak at "
+                f"t={tc:.6g} (index={ic}, sign={sc:+d})."
+            )
             continue
 
-        jj_best = min(candidates, key=lambda jj: abs(t_vary[jj] - tc))
+        # Pick the closest unused candidate.
+        jj_best = min(
+            candidates,
+            key=lambda jj: abs(t_vary[jj] - tc),
+        )
+
         matched.append((ic, idx_vary[jj_best]))
 
+        # Mark this varying peak as used so it cannot be assigned again.
+        used_vary.add(jj_best)
+
+        # Continue searching forward from the matched peak.
         j0 = jj_best + 1
 
     return matched
@@ -330,18 +417,22 @@ def extract_peak_ratio_time_series_from_reflections(
     tol_peak = peak_tol_frac * T0
 
     # 1. Identify signed peaks.
+
+    #make a common threshold
+    threshold = peak_prom_frac * max((np.max(np.abs(E_refl_const)), np.max(np.abs(E_refl_vary)) ))
+
     idx_c, sgn_c = _signed_peaks(
         E_refl_const,
         t_ax,
         f0,
-        peak_prom_frac=peak_prom_frac,
+        threshold,
     )
 
     idx_v, sgn_v = _signed_peaks(
         E_refl_vary,
         t_ax,
         f0,
-        peak_prom_frac=peak_prom_frac,
+        threshold,
     )
 
     # 2. Match peaks. These matched peaks are used for amplitude ratios.
@@ -512,8 +603,9 @@ def extract_peak_ratio_time_series_from_reflections(
         )
 
     # 5. Clip rising/falling edge samples after zero-crossing filtering.
-    if clip > 0 and len(t_peak_const) > 2 * clip:
-        sl = slice(clip, -clip)
+    clip_l,clip_r = clip
+    if (clip_l > 0 and clip_r>0) and len(t_peak_const) > (clip_r + clip_l):
+        sl = slice(clip_l, -clip_r)
 
         accepted_ic = accepted_ic[sl]
         accepted_iv = accepted_iv[sl]
@@ -536,7 +628,7 @@ def extract_peak_ratio_time_series_from_reflections(
         t_zero_vary = t_zero_vary[sl]
         t_target = t_target[sl]
 
-        matched_zero_pairs = matched_zero_pairs[clip:-clip]
+        matched_zero_pairs = matched_zero_pairs[clip_l:-clip_r]
 
     # 6. Use peak-time-interpolated zero-crossing delay for the phase.
     # Or we can do the converse, interpolate the peak ratios to the zero-crossing times
