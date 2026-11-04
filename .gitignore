@@ -25,6 +25,8 @@ output/*
 
 # Notebooks
 notebooks/*
+# except project2
+!/notebooks/project_2/
 
 # IDE
 .vscode/

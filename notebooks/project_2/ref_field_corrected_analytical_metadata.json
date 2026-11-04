@@ -1,0 +1,51 @@
+{
+  "method": "direct complex Fourier-spectrum division by analytical first-pass air/SiO2/air field transmission",
+  "reference_trace_index": 0,
+  "input_field": "/home/arch/MSC_studies/spring_26/semester_project/lightmatter/notebooks/project_2/ref_field.txt",
+  "input_time": "/home/arch/MSC_studies/spring_26/semester_project/lightmatter/notebooks/project_2/time_axis.txt",
+  "input_field_sha256": "a17cb6ca1c927b58104aab2fc91b6343db861960d0026e81bd6bd87c77e348a9",
+  "input_time_sha256": "fe6eadfcb249fdf525d264aa596af3a26f73d77eb6360d4066c11d1768742403",
+  "corrected_field_sha256": "68ad4c2b8a6d484ffffbede3f0d49c586f114f6f401fead26d1a8ea8a54d7027",
+  "time_axis": "/home/arch/MSC_studies/spring_26/semester_project/lightmatter/notebooks/project_2/time_axis.txt",
+  "field_units": "original experimental arbitrary units; no peak normalization",
+  "time_units": "fs",
+  "sample_count": 80057,
+  "sample_dt_ps": 1e-06,
+  "baseline_subtracted": 113.73770185069995,
+  "baseline_edge_fraction": 0.05,
+  "sample_thickness_um": 12.82,
+  "group_transit_ps": 0.0626421528374729,
+  "index_model": "n(omega)^2 = 1 + sum_j B_j*omega_j^2/(omega_j^2-omega^2); eps_inf=1; no carriers or damping",
+  "background_del_eps": [
+    0.6961663,
+    0.4079426,
+    0.8974794
+  ],
+  "background_lambda0_um": [
+    0.0684043,
+    0.1162414,
+    9.896161
+  ],
+  "index_reference": "https://doi.org/10.1364/JOSA.55.001205",
+  "transmission_formula": "T_first=4*n/(1+n)^2*exp(-i*omega*n*d/C0); T_shape=T_first*exp(+i*omega*group_transit_ps)",
+  "fft_convention": "forward exp(-i*omega*t); positive time delay has negative spectral phase",
+  "inverse_formula": "E_incident=irfft(rfft(E_measured_padded)*optical_taper/T_shape)",
+  "time_convention": "Original experimental axis retained; physical incident epoch shifted later by group_transit_ps, matching the FDTD comparison.",
+  "internal_reflections": false,
+  "finite_record_assumption": "First transmitted pass only; the ~125 fs internal echo is outside this 80 fs measurement.",
+  "spectral_taper_THz": [
+    40,
+    60,
+    320,
+    400
+  ],
+  "fft_size": 582120,
+  "padding_samples_before_record": 250569,
+  "analytic_roundtrip_relative_L2": 2.9101807050286683e-16,
+  "band_filter_relative_L2": 0.01954873469231551,
+  "correction_outside_saved_window_energy_fraction": 2.5023588186365926e-06,
+  "corrected_to_measured_peak_ratio": 1.0730561481722687,
+  "comparison_note": "Analytical transmission uses the continuum lossless refractive index; the finite-timestep FDTD material update can introduce numerical attenuation.",
+  "analytical_vs_fdtd_relative_L2": 0.04390497608803744,
+  "compared_fdtd_field_sha256": "28dec85471517c60845e9c7a89f6ccf8d269b26a4bc81daffc722adbc30d2ca9"
+}

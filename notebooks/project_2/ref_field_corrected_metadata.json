@@ -1,0 +1,89 @@
+{
+  "method": "regularized inverse of vacuum-calibrated first-pass unpumped SiO2 FDTD transmission",
+  "reference_trace_index": 0,
+  "input_field": "/home/arch/MSC_studies/spring_26/semester_project/lightmatter/notebooks/project_2/ref_field.txt",
+  "input_time": "/home/arch/MSC_studies/spring_26/semester_project/lightmatter/notebooks/project_2/time_axis.txt",
+  "input_field_sha256": "a17cb6ca1c927b58104aab2fc91b6343db861960d0026e81bd6bd87c77e348a9",
+  "input_time_sha256": "fe6eadfcb249fdf525d264aa596af3a26f73d77eb6360d4066c11d1768742403",
+  "corrected_field_sha256": "28dec85471517c60845e9c7a89f6ccf8d269b26a4bc81daffc722adbc30d2ca9",
+  "corrected_time_sha256": "520ae5e574f12a9cb2da63950336354780f97d33dfe510e6357c80f2751ecf2b",
+  "baseline_subtracted": 113.73770185069995,
+  "baseline_edge_fraction": 0.05,
+  "field_units": "original experimental arbitrary units; no peak normalization",
+  "time_units": "fs",
+  "sample_count": 80057,
+  "time_convention": "Original time axis retained. H_shape=H_slab*exp(+i*omega*group_transit_ps); incident epoch shifted later by group_transit_ps.",
+  "group_transit_ps": 0.0626421528374729,
+  "group_index_at_166_THz": 1.4648709027736095,
+  "source_to_probe_group_transit_ps": 0.09296312909098492,
+  "sample_thickness_um": 12.82,
+  "first_internal_echo_delay_fs": 125.28430567494581,
+  "finite_record_assumption": "Measured record contains the first pass only; later internal echoes are unmeasured, not constrained to zero.",
+  "spectral_taper_THz": [
+    40,
+    60,
+    320,
+    400
+  ],
+  "inverse_relative_regularization": 1e-06,
+  "background_del_eps": [
+    0.6961663,
+    0.4079426,
+    0.8974794
+  ],
+  "background_lambda0_um": [
+    0.0684043,
+    0.1162414,
+    9.896161
+  ],
+  "background_gamma_per_ps": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "reverse_fdtd_params": {
+    "Nz": 15000,
+    "Nt": 30767,
+    "dz": 20.0,
+    "dt": 6.60456908492341e-06,
+    "src_i": 12205,
+    "probe_t_i": 1250,
+    "probe_r_i": 2795,
+    "metal_i0": 4295,
+    "metal_i1": 10705,
+    "npml": 500,
+    "R_target": 1e-12,
+    "m": 4,
+    "snap_every": 0
+  },
+  "forward_validation_fdtd_params": {
+    "Nz": 15000,
+    "Nt": 43454,
+    "dz": 20.0,
+    "dt": 6.60456908492341e-06,
+    "src_i": 1250,
+    "probe_t_i": 12205,
+    "probe_r_i": 2795,
+    "metal_i0": 4295,
+    "metal_i1": 10705,
+    "npml": 500,
+    "R_target": 1e-12,
+    "m": 4,
+    "snap_every": 0
+  },
+  "calibration_gate_after_arrival_round_trips": [
+    0.45,
+    0.65
+  ],
+  "fft_size": 88000,
+  "fft_padding_each_side_ps": 0.2505686113498916,
+  "correction_outside_saved_window_energy_fraction": 2.5728192934112097e-06,
+  "band_filter_relative_L2": 0.01954873008637293,
+  "band_filter_removed_energy_fraction": 0.0004038885036242723,
+  "forward_vs_measured_relative_L2": 0.01948128425317173,
+  "forward_vs_bandlimited_measured_relative_L2": 0.000944432627651517,
+  "corrected_vs_measured_relative_L2": 1.0831553229913409,
+  "corrected_to_measured_peak_ratio": 1.1267012128145035,
+  "validation_source_prepad_ps": 0.02,
+  "validation_note": "Independent forward FDTD of saved-window corrected waveform with calibrated soft-source de-embedding; no fitted amplitude, phase or delay."
+}
