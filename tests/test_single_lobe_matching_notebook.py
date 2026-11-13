@@ -1,4 +1,4 @@
-"""Exercise the corrected exponent sweep and real analyses without running FDTD.
+"""Exercise the corrected FWHM/exponent sweep and real analyses without running FDTD.
 
 Only synthetic compact traces are produced, exclusively under pytest's tmp_path.
 The notebook's final invocation is removed before its definitions are loaded.
@@ -10,9 +10,11 @@ import ast
 import builtins
 import dis
 import hashlib
+import io
 import json
 from pathlib import Path
 import textwrap
+import zipfile
 
 import matplotlib
 
@@ -28,8 +30,9 @@ DELTA = 130.0
 DELAYS_FS = np.array([-10.0, 0.0, 10.0])
 CORRECTED_PEAK_FS = 29.4
 EXPONENTS = [4, 8, 12]
+FWHMS_FS = [1.0, 5.0, 10.0]
 PHASE = 0.0
-TAGS = ["E4", "E8", "E12"]
+TAGS = [f"FWHM_{width:g}fs_E{exponent}" for width in FWHMS_FS for exponent in EXPONENTS]
 SIMULATION_STAGES = ("helpers", "geometry", "cache_and_duration", "persistence", "controls", "delay_scan",
                      "timing_diagnostic", "geometry_plot")
 RUN_FIGURES = (
@@ -65,7 +68,7 @@ def runner(monkeypatch):
     assert isinstance(invocation, ast.Expr)
     assert isinstance(invocation.value, ast.Call)
     assert isinstance(invocation.value.func, ast.Name)
-    assert invocation.value.func.id == "run_corrected_exponent_variation"
+    assert invocation.value.func.id == "run_corrected_fwhm_exponent_variation"
     assert invocation.value.args == []
     assert invocation.value.keywords == []
     namespace = {"__name__": "__notebook_test__"}
@@ -101,7 +104,7 @@ def _synthetic_run_source(run_directory, pump_directory, gamma, complete, proven
         UNIT_T = 1e-12
         base_dir = Path({str(run_directory)!r})
         base_dir.mkdir(parents=True, exist_ok=True)
-        with (base_dir.parent.parent / "synthetic_producer_calls.txt").open("a") as stream:
+        with (base_dir.parent.parent.parent / "synthetic_producer_calls.txt").open("a") as stream:
             stream.write({case["tag"]!r} + "\\n")
         time_fs = np.arange(1001) * 0.1
         t_ps = time_fs * 1e-3
@@ -119,6 +122,7 @@ def _synthetic_run_source(run_directory, pump_directory, gamma, complete, proven
         common = dict(fdtd_params=fdtd_params, pulse_params=pulse_params,
                       gamma_D_per_ps={gamma!r}, del_omega_D_rad_per_ps={DELTA!r}, omega_D0_rad_per_ps=0.0,
                       pump_field_exponent={case["exponent"]!r},
+                      pump_intensity_fwhm_fs={case["fwhm_fs"]!r},
                       pump_common_envelope_phase_rad=0.0,
                       pump_common_envelope_phase_label="0",
                       last_window_transmitted_energy_fraction=0.0)
@@ -135,7 +139,8 @@ def _synthetic_run_source(run_directory, pump_directory, gamma, complete, proven
         rows = []
         for index, delay in enumerate((-10.0, 0.0, 10.0)):
             folder = f"delay_{{index:04d}}"
-            scale = 1.0 + ({gamma!r} - 100.0)/1000.0 + {case["exponent"]!r}/100.0 + 0.05*index
+            scale = (1.0 + ({gamma!r} - 100.0)/1000.0 + {case["exponent"]!r}/100.0
+                     + {case["fwhm_fs"]!r}/100.0 + 0.05*index)
             save(folder, scale*reference, "pump_driven", delay)
             rows.append(dict(index=index, delay_fs=delay, folder=folder))
         manifest = dict(complete={complete!r}, completed_indices=[0, 1, 2] if {complete!r} else [0, 1], runs=rows)
@@ -148,8 +153,13 @@ def _synthetic_run_source(run_directory, pump_directory, gamma, complete, proven
                       pump_common_envelope_phase_rad=0.0,
                       pump_common_envelope_phase_label="0",
                       pump_field_exponent={case["exponent"]!r},
+                      pump_intensity_fwhm_fs={case["fwhm_fs"]!r},
                       delay_definition="probe incident abs(E) peak minus pump incident abs(E) peak at the sample front; positive=pump first")
         config.update({settings!r})
+        cache_stride = 1 if {case['fwhm_fs']!r} == 1.0 else 3
+        config.update(requested_injection_cache_dt_fs=None if {case['fwhm_fs']!r} == 1.0 else 0.02,
+                      injection_cache_stride_pump_steps=cache_stride,
+                      injection_cache_actual_dt_fs=cache_stride * {correction_metadata['reverse_fdtd_params']['dt']!r} * 1e3)
         (base_dir / "scan_configuration.json").write_text(json.dumps(config))
         np.savez_compressed(base_dir / "shared_axes.npz", probe_source_t_rel_ps=waveform_time_rel_ps,
                             probe_source_E=reference_field)
@@ -193,6 +203,7 @@ def _configure_synthetic_run(runner, tmp_path):
         "input_field": str(experiment_dir / "ref_field.txt"),
         "input_time": str(experiment_dir / "time_axis.txt"),
         "sample_count": int(corrected_time_fs.size),
+        "reverse_fdtd_params": dict(runner["matching_source_metadata"]["reverse_fdtd_params"]),
     }
     for key, filename in (
         ("input_field_sha256", "ref_field.txt"), ("input_time_sha256", "time_axis.txt"),
@@ -214,14 +225,16 @@ def _configure_synthetic_run(runner, tmp_path):
     )
     for stage in SIMULATION_STAGES:
         runner["matching_simulation_code"][stage] = compile("pass", f"disabled-{stage}", "exec")
-    pump_directory = runner["_matching_pump_directory"]()
+    pump_directories = {width: str(runner["_matching_pump_directory"](next(
+        case for case in runner["matching_cases"] if case["fwhm_fs"] == width)))
+        for width in FWHMS_FS}
     pump_source = textwrap.dedent(f"""
         from pathlib import Path
         import json
-        pump_output_dir = Path({str(pump_directory)!r})
+        pump_output_dir = Path({pump_directories!r}[MATCHING_PUMP_FWHM_FS])
         pump_output_dir.mkdir(parents=True)
-        with (pump_output_dir.parent / "synthetic_pump_calls.jsonl").open("a") as stream:
-            stream.write(json.dumps(dict(phase=MATCHING_PUMP_PHASE_RAD)) + "\\n")
+        with (pump_output_dir.parent.parent / "synthetic_pump_calls.jsonl").open("a") as stream:
+            stream.write(json.dumps(dict(phase=MATCHING_PUMP_PHASE_RAD, fwhm_fs=MATCHING_PUMP_FWHM_FS)) + "\\n")
         for filename in ("info.json", "data.npz", "pump_metadata.json", "pump_material_probes.npz", "pump_propagation.png"):
             (pump_output_dir / filename).write_bytes(b"synthetic pump placeholder; no FDTD")
         import matplotlib.pyplot as plt
@@ -232,8 +245,8 @@ def _configure_synthetic_run(runner, tmp_path):
     """)
     probe_sources = {}
     for case in runner["matching_cases"]:
-        probe_sources[case["exponent"]] = _synthetic_run_source(
-            runner["_matching_scan_directory"](case), pump_directory, GAMMAS[0], True,
+        probe_sources[case["fwhm_fs"], case["exponent"]] = _synthetic_run_source(
+            runner["_matching_scan_directory"](case), runner["_matching_pump_directory"](case), GAMMAS[0], True,
             runner["matching_source_provenance"], runner["_matching_expected_scan_settings"](),
             runner["matching_source_metadata"], experiment_dir, case,
         )
@@ -243,7 +256,7 @@ def _configure_synthetic_run(runner, tmp_path):
     for stage in ("pump_run", "pump_plot"):
         runner["matching_simulation_code"][stage] = compile("pass", f"disabled-{stage}", "exec")
     runner["matching_probe_code"][GAMMAS[0]] = compile(
-        f"exec({probe_sources!r}[PUMP_FIELD_EXPONENT])",
+        f"exec({probe_sources!r}[(MATCHING_PUMP_FWHM_FS, PUMP_FIELD_EXPONENT)])",
         "synthetic-compact-traces", "exec",
     )
     return output
@@ -394,7 +407,7 @@ def test_exponent_configuration_and_all_stage_compilation(runner):
     assert _literal_config(runner, "SCAN_MARGIN_FS") == 20.0
     assert _literal_config(runner, "PROBE_DZ_A") is None
     assert runner["matching_source_metadata"]["reverse_fdtd_params"]["dz"] == 20.0
-    assert runner["matching_output_dir"] == NOTEBOOK.parents[2] / "output/project2/corrected/exponent_variation"
+    assert runner["matching_output_dir"] == NOTEBOOK.parents[2] / "output/project2/corrected/fwhm_exponent_variation"
     assert set(runner["matching_probe_code"]) == {250.0}
     settings = runner["matching_settings"]
     assert settings["MATCHING_GAMMA_D0"] == GAMMAS
@@ -403,16 +416,20 @@ def test_exponent_configuration_and_all_stage_compilation(runner):
     assert "MATCHING_EXTEND_EXISTING" not in settings
     assert "MATCHING_PUMP_INPUT_RELATIVE" not in settings
     assert [case["tag"] for case in runner["matching_cases"]] == TAGS
-    assert [case["exponent"] for case in runner["matching_cases"]] == EXPONENTS
+    assert [case["exponent"] for case in runner["matching_cases"]] == EXPONENTS * 3
+    assert [case["fwhm_fs"] for case in runner["matching_cases"]] == [width for width in FWHMS_FS for _ in EXPONENTS]
+    assert settings["MATCHING_PUMP_FWHMS_FS"] == FWHMS_FS
+    assert "MATCHING_PUMP_NAME" not in settings
     assert settings["MATCHING_PUMP_PHASE_RAD"] == PHASE
-    assert [case["label"] for case in runner["matching_cases"]] == ["E^4", "E^8", "E^12"]
+    assert [case["label"] for case in runner["matching_cases"]] == [
+        f"FWHM {width:g} fs; E^{exponent}" for width in FWHMS_FS for exponent in EXPONENTS]
     for case in runner["matching_cases"]:
         pump = runner["_matching_pump_directory"](case)
         scan = runner["_matching_scan_directory"](case)
-        assert pump.name == "pump_3fs_1p5eV_sio2_12p82um"
-        assert pump.parent == runner["matching_output_dir"]
-        assert scan.parent == runner["matching_output_dir"] / case["tag"]
-        assert scan.name == f"probe_pump_sqrt_E{case['exponent']}_3fs_1p5eV_gamma_D0_250.0000_ps-1_del_omega_D_130.0000_rad-ps-1_cubic"
+        assert pump.name == f"pump_{case['fwhm_fs']:g}fs_1p5eV_sio2_12p82um"
+        assert pump.parent == runner["matching_output_dir"] / case["width_tag"]
+        assert scan.parent == runner["matching_output_dir"] / case["width_tag"] / case["exponent_tag"]
+        assert scan.name == f"probe_pump_sqrt_E{case['exponent']}_{case['fwhm_fs']:g}fs_1p5eV_gamma_D0_250.0000_ps-1_del_omega_D_130.0000_rad-ps-1_cubic"
     setup = runner["matching_simulation_sources"]["probe_setup"]
     assert '"ref_field_corrected.txt"' in setup
     assert '"time_axis_corrected.txt"' in setup
@@ -470,8 +487,9 @@ def test_run_all_skips_intermediate_stages_before_final_runner(runner, tmp_path,
 def test_actual_corrected_geometry_and_exponent_preflight_are_read_only(runner):
     before = _file_snapshot(runner["matching_output_dir"])
     plans = runner["_matching_preflight"]()
-    assert len(plans) == 3
-    assert [plan["exponent"] for plan in plans] == EXPONENTS
+    assert len(plans) == 9
+    assert [plan["exponent"] for plan in plans] == EXPONENTS * 3
+    assert [plan["fwhm_fs"] for plan in plans] == [width for width in FWHMS_FS for _ in EXPONENTS]
     assert _file_snapshot(runner["matching_output_dir"]) == before
 
 
@@ -479,7 +497,7 @@ def test_fresh_exponent_cases_need_no_existing_pump_or_probe_scan(runner, tmp_pa
     output = _configure_synthetic_run(runner, tmp_path)
     assert not output.exists()
     plans = runner["_matching_preflight"]()
-    assert len(plans) == 3
+    assert len(plans) == 9
     for case, plan in zip(runner["matching_cases"], plans):
         assert plan["gamma_D0_per_ps"] == 250.0
         assert plan["reuse"] is False
@@ -489,13 +507,14 @@ def test_fresh_exponent_cases_need_no_existing_pump_or_probe_scan(runner, tmp_pa
     assert not output.exists()
 
 
-def test_three_exponents_export_real_analyses_and_reuse_without_producers(runner, tmp_path):
+def test_nine_width_exponents_export_real_analyses_and_reuse_without_producers(runner, tmp_path):
     output = _configure_synthetic_run(runner, tmp_path)
-    runner["run_corrected_exponent_variation"]()
+    runner["run_corrected_fwhm_exponent_variation"]()
     assert (output / "synthetic_producer_calls.txt").read_text().splitlines() == TAGS
     pump_calls = [json.loads(line) for line in (output / "synthetic_pump_calls.jsonl").read_text().splitlines()]
-    assert len(pump_calls) == 1
-    assert pump_calls[0]["phase"] == PHASE
+    assert len(pump_calls) == 3
+    assert [call["fwhm_fs"] for call in pump_calls] == FWHMS_FS
+    assert all(call["phase"] == PHASE for call in pump_calls)
     manifest = json.loads((output / "grid_manifest.json").read_text())
     assert manifest["complete"] is True
     assert manifest["comparison_status"] == "complete"
@@ -503,15 +522,17 @@ def test_three_exponents_export_real_analyses_and_reuse_without_producers(runner
     assert manifest["gamma_D0_per_ps"] == GAMMAS
     assert manifest["del_omega_D_rad_per_ps"] == DELTA
     assert manifest["pump_field_exponents"] == EXPONENTS
+    assert manifest["pump_intensity_fwhms_fs"] == FWHMS_FS
     assert manifest["pump_common_envelope_phase_rad"] == PHASE
-    assert manifest["shared_pump_status"] == "complete"
+    assert len(manifest["shared_pumps"]) == 3
+    assert all(pump["status"] == "complete" for pump in manifest["shared_pumps"])
     assert len(manifest["saved_source_sha256"]) == 64
     assert (output / "executed_cell_sources.json").is_file()
     comparison = runner["matching_comparison_dir"]
     metadata = json.loads((comparison / "comparison_metadata.json").read_text())
-    assert len(metadata["datasets"]) == len(manifest["runs"]) == 3
-    assert len({dataset["analysis_file"] for dataset in metadata["datasets"]}) == 3
-    assert len({record["figure_directory"] for record in manifest["runs"]}) == 3
+    assert len(metadata["datasets"]) == len(manifest["runs"]) == 9
+    assert len({dataset["analysis_file"] for dataset in metadata["datasets"]}) == 9
+    assert len({record["figure_directory"] for record in manifest["runs"]}) == 9
     preserved = {}
     for case, record, dataset in zip(runner["matching_cases"], manifest["runs"], metadata["datasets"]):
         assert record["status"] == "complete"
@@ -520,11 +541,12 @@ def test_three_exponents_export_real_analyses_and_reuse_without_producers(runner
         assert record["del_omega_D_rad_per_ps"] == DELTA
         assert record["number_of_delays"] == 3
         assert record["pump_field_exponent"] == case["exponent"]
+        assert record["pump_intensity_fwhm_fs"] == case["fwhm_fs"]
         assert record["pump_common_envelope_phase_rad"] == PHASE
         directory = Path(record["scan_directory"])
         assert directory == runner["_matching_scan_directory"](case)
         assert case["tag"] in dataset["analysis_file"]
-        expected = (1.15 + case["exponent"]/100 + 0.05*np.arange(3))**2
+        expected = (1.15 + case["exponent"]/100 + case["fwhm_fs"]/100 + 0.05*np.arange(3))**2
         with np.load(directory / "delay_scan_analysis.npz") as analysis:
             np.testing.assert_allclose(analysis["transmitted_energy_ratio"], expected)
         with np.load(directory / "single_lobe_analysis/lobe_energy_analysis.npz") as analysis:
@@ -541,6 +563,7 @@ def test_three_exponents_export_real_analyses_and_reuse_without_producers(runner
         for filename in COMPARISON_FIGURES:
             assert (per_case / filename).stat().st_size > 1000
         assert dataset["pump_field_exponent"] == case["exponent"]
+        assert dataset["pump_intensity_fwhm_fs"] == case["fwhm_fs"]
         assert dataset["pump_common_envelope_phase_rad"] == PHASE
         assert dataset["alignment_score"] > 0.999
         assert dataset["waveform_shift_fs"] == pytest.approx(-16.5, abs=0.01)
@@ -551,6 +574,17 @@ def test_three_exponents_export_real_analyses_and_reuse_without_producers(runner
         preserved[runner["_matching_pump_directory"](case)] = _file_snapshot(runner["_matching_pump_directory"](case))
         for filename in ("shared_axes.npz", "shared_profile.npy"):
             assert (directory / filename).is_file()
+    assert len({runner["_matching_pump_directory"](case) for case in runner["matching_cases"]}) == 3
+    assert len({runner["_matching_scan_directory"](case) / "shared_profile.npy"
+                for case in runner["matching_cases"]}) == 9
+    for width in FWHMS_FS:
+        width_comparison = output / f"FWHM_{width:g}fs" / "experimental_simulation_comparison"
+        width_metadata = json.loads((width_comparison / "comparison_metadata.json").read_text())
+        assert len(width_metadata["datasets"]) == 3
+        assert [dataset["pump_field_exponent"] for dataset in width_metadata["datasets"]] == EXPONENTS
+        assert all(dataset["pump_intensity_fwhm_fs"] == width for dataset in width_metadata["datasets"])
+        for filename in COMPARISON_FIGURES:
+            assert (width_comparison / filename).stat().st_size > 1000
     experimental = np.genfromtxt(comparison / "experimental_energy_analysis.csv", names=True, delimiter=",")
     np.testing.assert_allclose(experimental["pulse_ratio"], [1.0, 0.64, 1.44])
     np.testing.assert_allclose(experimental["lobe_ratio"], [1.0, 0.64, 1.44])
@@ -566,13 +600,13 @@ def test_three_exponents_export_real_analyses_and_reuse_without_producers(runner
     runner["matching_probe_code"][250.0] = sentinel
     for stage in (*SIMULATION_STAGES, "pump_setup", "pump_run", "pump_plot"):
         runner["matching_simulation_code"][stage] = sentinel
-    runner["run_corrected_exponent_variation"]()
+    runner["run_corrected_fwhm_exponent_variation"]()
     assert {folder: _file_snapshot(folder) for folder in preserved} == preserved
     assert (output / "synthetic_producer_calls.txt").read_bytes() == producer_log
     assert (output / "synthetic_pump_calls.jsonl").read_bytes() == pump_log
     second_manifest = json.loads((output / "grid_manifest.json").read_text())
     assert second_manifest["complete"] is True
-    assert second_manifest["shared_pump_status"] == "reused"
+    assert all(pump["status"] == "reused" for pump in second_manifest["shared_pumps"])
     assert all(record["reused_completed_scan"] for record in second_manifest["runs"])
 
 
@@ -581,7 +615,7 @@ def test_incomplete_case_fails_preflight_without_writes(runner, tmp_path):
     _make_saved_scan(runner, complete=False)
     before = _file_snapshot(output)
     with pytest.raises(RuntimeError, match="Incomplete saved scan"):
-        runner["run_corrected_exponent_variation"]()
+        runner["run_corrected_fwhm_exponent_variation"]()
     assert _file_snapshot(output) == before
 
 
@@ -595,7 +629,7 @@ def test_existing_case_must_match_material_and_pump(runner, tmp_path, key, value
     config_path.write_text(json.dumps(config))
     before = _file_snapshot(output)
     with pytest.raises(ValueError, match="parameters or .*pump directory"):
-        runner["run_corrected_exponent_variation"]()
+        runner["run_corrected_fwhm_exponent_variation"]()
     assert _file_snapshot(output) == before
 
 
@@ -608,7 +642,7 @@ def test_existing_case_must_match_corrected_source_before_writes(runner, tmp_pat
     config_path.write_text(json.dumps(config))
     before = _file_snapshot(output)
     with pytest.raises(RuntimeError, match="corrected-source provenance"):
-        runner["run_corrected_exponent_variation"]()
+        runner["run_corrected_fwhm_exponent_variation"]()
     assert _file_snapshot(output) == before
 
 
@@ -627,7 +661,7 @@ def test_reused_case_validates_incident_source_before_analysis_writes(runner, tm
         path.write_text(path.read_text() + "\n")
     before = _file_snapshot(tmp_path)
     with pytest.raises(ValueError, match="source|hash|input"):
-        runner["run_corrected_exponent_variation"]()
+        runner["run_corrected_fwhm_exponent_variation"]()
     assert _file_snapshot(tmp_path) == before
 
 
@@ -637,7 +671,7 @@ def test_missing_completed_case_artifacts_fail_without_writes(runner, tmp_path, 
     (_make_saved_scan(runner) / relative).unlink()
     before = _file_snapshot(output)
     with pytest.raises(FileNotFoundError):
-        runner["run_corrected_exponent_variation"]()
+        runner["run_corrected_fwhm_exponent_variation"]()
     assert _file_snapshot(output) == before
 
 
@@ -645,32 +679,64 @@ def test_changed_source_since_runner_setup_fails_before_writes(runner, tmp_path)
     output = _configure_synthetic_run(runner, tmp_path)
     runner["matching_source_provenance"] = {"corrected_field_sha256": "stale-runner-source"}
     with pytest.raises(RuntimeError, match="Corrected source changed"):
-        runner["run_corrected_exponent_variation"]()
+        runner["run_corrected_fwhm_exponent_variation"]()
     assert not output.exists()
 
 
-def _small_pump_inputs(runner, tmp_path):
-    """Authentic geometry and formula, with a compact three-step field archive."""
+def _write_header_only_pump_archive(path, arrays, field_shape):
+    """Supply the E header that preflight reads, without allocating pump fields."""
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        header = io.BytesIO()
+        np.lib.format.write_array_header_1_0(
+            header, dict(descr=np.dtype(float).str, fortran_order=False, shape=field_shape))
+        archive.writestr("E.npy", header.getvalue())
+        for key, values in arrays.items():
+            stream = io.BytesIO()
+            np.save(stream, values, allow_pickle=False)
+            archive.writestr(key + ".npy", stream.getvalue())
+
+
+def _small_pump_inputs(runner, tmp_path, case_index=0):
+    """Authentic source/geometry/timing; the large E payload is intentionally absent."""
     actual = NOTEBOOK.parents[2] / "output/project2/SINGLE_LOBE_MATCHING_del_omega_130/pump_3fs_1p5eV_sio2_12p82um"
     info = json.loads((actual / "info.json").read_text())
-    info["fdtd_params"]["Nt"] = 3
-    case = runner["matching_cases"][0]
+    case = runner["matching_cases"][case_index]
+    tau = case["fwhm_fs"] * 1e-3 / (2 * np.sqrt(np.log(2)))
+    t0 = max(0.010, 6 * tau)
+    info["pulse_params"].update(tau=tau, t0=t0)
     info["pulse_params"]["phase"] = PHASE
     metadata = json.loads((actual / "pump_metadata.json").read_text())
     metadata["common_envelope_phase_rad"] = PHASE
     metadata["common_envelope_phase_label"] = "0"
-    runner["matching_output_dir"] = tmp_path / "exponent_variation"
+    metadata["intensity_envelope_fwhm_fs"] = case["fwhm_fs"]
+    metadata["envelope_center_fs"] = t0 * 1e3
+    metadata["material_probe_boundary_cells_included"] = True
+    metadata["probe_every_cells"] = 4 if case["fwhm_fs"] == 1.0 else 9
+    params = info["fdtd_params"]
+    c0 = 2997924.58  # Angstrom / ps
+    wavelength = c0 * 1e-4 / info["pulse_params"]["f0"]
+    resonances_squared = np.asarray(metadata["background_lambda0_um"])**2
+    coefficients = np.asarray(metadata["background_del_eps"])
+    index = np.sqrt(1 + np.sum(coefficients * wavelength**2 / (wavelength**2 - resonances_squared)))
+    derivative = np.sum(-2 * coefficients * wavelength * resonances_squared / (wavelength**2-resonances_squared)**2)
+    group_index = index - wavelength * derivative / (2 * index)
+    transit = ((params["metal_i0"]-params["src_i"] + params["probe_t_i"]-params["metal_i1"])
+               + group_index*(params["metal_i1"]-params["metal_i0"])) * params["dz"] / c0
+    params["Nt"] = int(np.ceil((t0 + 6*tau + transit + 0.030) / params["dt"])) + 1
+    runner["matching_output_dir"] = tmp_path / "fwhm_exponent_variation"
     directory = runner["_matching_pump_directory"](case)
     directory.mkdir(parents=True)
     (directory / "info.json").write_text(json.dumps(info))
     (directory / "pump_metadata.json").write_text(json.dumps(metadata))
     pulse = info["pulse_params"]
-    times = np.arange(3) * info["fdtd_params"]["dt"]
+    times = np.arange(params["Nt"]) * params["dt"]
     source = (pulse["E0"] * np.cos(2*np.pi*pulse["f0"]*(times-pulse["t0"]) + pulse["phase"])
               * np.exp(-0.5*((times-pulse["t0"])/pulse["tau"])**2))
-    indices = info["fdtd_params"]["metal_i0"] + np.arange(2)
-    np.savez(directory / "pump_material_probes.npz", E=np.ones((3, 2)), t_ps=times,
-             z_A=indices*info["fdtd_params"]["dz"], source_E=source, cell_indices=indices)
+    indices = np.unique(np.r_[np.arange(params["metal_i0"], params["metal_i1"], metadata["probe_every_cells"]),
+                              params["metal_i1"]-1])
+    _write_header_only_pump_archive(directory / "pump_material_probes.npz",
+                                   dict(t_ps=times, z_A=indices*params["dz"], source_E=source, cell_indices=indices),
+                                   (times.size, indices.size))
     (directory / "data.npz").write_bytes(b"compact result placeholder")
     (directory / "pump_propagation.png").write_bytes(b"plot placeholder")
     return directory
@@ -686,44 +752,61 @@ def test_missing_existing_pump_inputs_fail_read_only(runner, tmp_path, filename)
     assert _file_snapshot(tmp_path) == before
 
 
-@pytest.mark.parametrize("bad_input", ("grid", "pulse", "background", "array_shape", "phase", "metadata_phase", "source_phase"))
+@pytest.mark.parametrize("bad_input", ("grid", "pulse", "background", "array_shape", "phase", "metadata_phase",
+                                        "source_phase", "width", "center", "duration", "boundary", "probe_stride", "probe_indices"))
 def test_incompatible_pump_inputs_fail_read_only(runner, tmp_path, bad_input):
     directory = _small_pump_inputs(runner, tmp_path)
-    runner["_matching_validate_pump_inputs"](directory, PHASE)
-    if bad_input in ("grid", "phase"):
+    runner["_matching_validate_pump_inputs"](directory, PHASE, FWHMS_FS[0])
+    if bad_input in ("grid", "phase", "duration", "center"):
         path = directory / "info.json"
         info = json.loads(path.read_text())
         if bad_input == "grid":
             info["fdtd_params"]["dz"] *= 2
-        else:
+        elif bad_input == "phase":
             info["pulse_params"]["phase"] = np.pi/4
+        elif bad_input == "center":
+            info["pulse_params"]["t0"] = 0.0
+        else:
+            info["fdtd_params"]["Nt"] -= 1
         path.write_text(json.dumps(info))
-    elif bad_input in ("pulse", "background", "metadata_phase"):
+    elif bad_input in ("pulse", "background", "metadata_phase", "width", "boundary", "probe_stride"):
         path = directory / "pump_metadata.json"
         metadata = json.loads(path.read_text())
         if bad_input == "pulse":
             metadata["carrier_energy_eV"] = 4.0
         elif bad_input == "metadata_phase":
             metadata["common_envelope_phase_rad"] = np.pi/4
+        elif bad_input == "width":
+            metadata["intensity_envelope_fwhm_fs"] = 3.0
+        elif bad_input == "boundary":
+            metadata["material_probe_boundary_cells_included"] = False
+        elif bad_input == "probe_stride":
+            metadata["probe_every_cells"] = 9
         else:
             metadata["background_del_eps"][0] *= 2
         path.write_text(json.dumps(metadata))
     else:
         path = directory / "pump_material_probes.npz"
         with np.load(path) as data:
-            arrays = {name: data[name] for name in data.files}
+            arrays = {name: data[name] for name in data.files if name != "E"}
+        shape = (arrays["t_ps"].size, arrays["z_A"].size)
         if bad_input == "array_shape":
-            arrays["E"] = np.ones((2, 3))
+            shape = (2, 3)
+        elif bad_input == "probe_indices":
+            selected = np.unique(np.r_[np.arange(0, arrays["cell_indices"].size, 2), arrays["cell_indices"].size-1])
+            arrays["cell_indices"] = arrays["cell_indices"][selected]
+            arrays["z_A"] = arrays["z_A"][selected]
+            shape = (arrays["t_ps"].size, arrays["z_A"].size)
         else:
             arrays["source_E"] *= -1
-        np.savez(path, **arrays)
+        _write_header_only_pump_archive(path, arrays, shape)
     before = _file_snapshot(tmp_path)
-    with pytest.raises(ValueError, match="disagree|configured|phase|source|CEP|pulse"):
+    with pytest.raises(ValueError, match="disagree|configured|phase|source|CEP|pulse|duration|FWHM|boundary|probe"):
         runner["_matching_preflight"]()
     assert _file_snapshot(tmp_path) == before
 
 
-@pytest.mark.parametrize("case_index", (0, 2))
+@pytest.mark.parametrize("case_index", (0, 8))
 def test_changed_scan_settings_fail_before_writes(runner, tmp_path, case_index):
     output = _configure_synthetic_run(runner, tmp_path)
     config_path = _make_saved_scan(runner, case=runner["matching_cases"][case_index]) / "scan_configuration.json"
@@ -732,24 +815,45 @@ def test_changed_scan_settings_fail_before_writes(runner, tmp_path, case_index):
     config_path.write_text(json.dumps(config))
     before = _file_snapshot(output)
     with pytest.raises(ValueError, match="setting|configuration"):
-        runner["run_corrected_exponent_variation"]()
+        runner["run_corrected_fwhm_exponent_variation"]()
     assert _file_snapshot(output) == before
 
 
 @pytest.mark.parametrize("key,value", (("pump_common_envelope_phase_rad", np.pi/4),
                                        ("pump_common_envelope_phase_label", "pi/2"),
-                                       ("pump_field_exponent", 8)))
+                                       ("pump_field_exponent", 8), ("pump_intensity_fwhm_fs", 3.0)))
 def test_existing_scan_with_wrong_exponent_or_cep_fails_before_any_case_starts(runner, tmp_path, key, value):
     output = _configure_synthetic_run(runner, tmp_path)
-    # A conflicting third case must be found before the absent first two start.
+    # A conflicting ninth case must be found before any absent earlier case starts.
     directory = _make_saved_scan(runner, case=runner["matching_cases"][-1])
     path = directory / "scan_configuration.json"
     config = json.loads(path.read_text())
     config[key] = value
     path.write_text(json.dumps(config))
     before = _file_snapshot(tmp_path)
-    with pytest.raises(ValueError, match="CEP|phase|exponent|configuration|parameters"):
-        runner["run_corrected_exponent_variation"]()
+    with pytest.raises(ValueError, match="CEP|phase|exponent|configuration|parameters|width|FWHM"):
+        runner["run_corrected_fwhm_exponent_variation"]()
+    assert _file_snapshot(tmp_path) == before
+    assert not (output / "synthetic_pump_calls.jsonl").exists()
+
+
+@pytest.mark.parametrize("case_index,key,value", (
+    (0, "requested_injection_cache_dt_fs", 0.02),
+    (0, "injection_cache_stride_pump_steps", 3),
+    (8, "requested_injection_cache_dt_fs", None),
+    (8, "injection_cache_stride_pump_steps", 9),
+    (8, "injection_cache_actual_dt_fs", 0.1),
+))
+def test_saved_cache_sampling_must_match_width_before_any_case_starts(runner, tmp_path, case_index, key, value):
+    output = _configure_synthetic_run(runner, tmp_path)
+    directory = _make_saved_scan(runner, case=runner["matching_cases"][case_index])
+    path = directory / "scan_configuration.json"
+    config = json.loads(path.read_text())
+    config[key] = value
+    path.write_text(json.dumps(config))
+    before = _file_snapshot(tmp_path)
+    with pytest.raises(ValueError, match="cache sampling"):
+        runner["run_corrected_fwhm_exponent_variation"]()
     assert _file_snapshot(tmp_path) == before
     assert not (output / "synthetic_pump_calls.jsonl").exists()
 
@@ -761,27 +865,90 @@ def test_fresh_sweep_rejects_changed_raw_inputs_before_any_producer(runner, tmp_
     path.write_text(path.read_text() + "\n")
     before = _file_snapshot(tmp_path)
     with pytest.raises(ValueError, match="hash|input|provenance|changed"):
-        runner["run_corrected_exponent_variation"]()
+        runner["run_corrected_fwhm_exponent_variation"]()
     assert _file_snapshot(tmp_path) == before
     assert not output.exists()
 
 
-def test_actual_pump_setup_uses_the_default_zero_phase(runner):
-    # Execute only the small source definitions, with a data-only PulseParams
-    # stand-in. No solver import, material allocation, or simulation is allowed.
+def _pure_pump_definitions(runner, width):
+    """Evaluate only source/geometry algebra with a data-only PulseParams stub."""
     from types import SimpleNamespace
     from scipy.constants import elementary_charge, h
 
     tree = ast.parse(runner["matching_simulation_sources"]["pump_setup"])
-    names = ("PUMP_INTENSITY_FWHM_FS", "PUMP_ENERGY_EV", "pump_f0", "pump_tau", "pump_pulse", "pump_source_field")
-    nodes = [runner["_matching_assignment"](tree, name) for name in names]
-    source = compile(ast.Module(body=nodes, type_ignores=[]), "actual-source-definitions-only", "exec")
+    assignments = {target.id: node for node in tree.body if isinstance(node, ast.Assign)
+                   for target in node.targets if isinstance(target, ast.Name)}
     namespace = dict(np=np, elementary_charge=elementary_charge, h=h, UNIT_T=1e-12,
-                     PulseParams=SimpleNamespace, MATCHING_PUMP_PHASE_RAD=PHASE,
-                     pump_time_ps=np.linspace(0.005, 0.015, 1001))
+                     C0=2997924.58, PulseParams=SimpleNamespace,
+                     MATCHING_PUMP_PHASE_RAD=PHASE, MATCHING_PUMP_FWHM_FS=width,
+                     SIO2_BACKGROUND_DEL_EPS_DEFAULT=runner["matching_source_metadata"]["background_del_eps"],
+                     SIO2_BACKGROUND_LAMBDA0_UM_DEFAULT=runner["matching_source_metadata"]["background_lambda0_um"])
+    needed = set()
+
+    def require(name):
+        if name in needed or name not in assignments or name in namespace:
+            return
+        needed.add(name)
+        for node in ast.walk(assignments[name].value):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                require(node.id)
+
+    for name in ("pump_pulse", "pump_source_field", "pump_Nt", "pump_probe_indices"):
+        require(name)
+    nodes = [node for node in tree.body if isinstance(node, ast.Assign)
+             and any(isinstance(target, ast.Name) and target.id in needed for target in node.targets)]
+    source = compile(ast.Module(body=nodes, type_ignores=[]), "actual-source-definitions-only", "exec")
     exec(source, namespace)
-    assert namespace["pump_pulse"].phase == PHASE
-    assert namespace["pump_source_field"][500] == pytest.approx(1.0, abs=1e-14)
+    return namespace
+
+
+@pytest.mark.parametrize("width", FWHMS_FS)
+def test_actual_pump_source_has_requested_intensity_fwhm_zero_phase_and_tails(runner, width):
+    namespace = _pure_pump_definitions(runner, width)
+    pulse = namespace["pump_pulse"]
+    assert pulse.phase == PHASE
+    assert pulse.E0 == 1.0
+    assert pulse.t0 >= 6 * pulse.tau
+    assert pulse.t0 >= 0.010
+    # Squaring the Gaussian field envelope gives exp(-(delta_t/tau)**2).
+    assert np.exp(-((width * 1e-3/2) / pulse.tau)**2) == pytest.approx(0.5)
+    assert np.exp(-0.5*(pulse.t0/pulse.tau)**2) <= np.exp(-18) * (1 + 1e-12)
+    times = namespace["pump_time_ps"]
+    expected = (np.cos(2*np.pi*pulse.f0*(times-pulse.t0))
+                * np.exp(-0.5*((times-pulse.t0)/pulse.tau)**2))
+    np.testing.assert_allclose(namespace["pump_source_field"], expected, rtol=0, atol=0)
+    assert times[-1] >= pulse.t0 + 6*pulse.tau + namespace["pump_transit_ps"] + 0.030
+    assert times[-1] - namespace["pump_duration_ps"] <= namespace["pump_dt"] * (1 + 1e-10)
+    assert namespace["pump_probe_indices"][0] == namespace["pump_metal_i0"]
+    assert namespace["pump_probe_indices"][-1] == namespace["pump_metal_i1"] - 1
+
+
+def test_pump_duration_increases_with_width_and_validates_each_saved_width(runner, tmp_path):
+    durations = [_pure_pump_definitions(runner, width)["pump_duration_ps"] for width in FWHMS_FS]
+    assert np.all(np.diff(durations) > 0)
+    for case_index in (0, 3, 6):
+        directory = _small_pump_inputs(runner, tmp_path, case_index=case_index)
+        before = _file_snapshot(tmp_path)
+        runner["_matching_validate_pump_inputs"](directory, PHASE, runner["matching_cases"][case_index]["fwhm_fs"])
+        assert _file_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("width,expected_stride", ((1.0, 1), (5.0, 3), (10.0, 3)))
+def test_temporal_cache_retains_native_sampling_for_shortest_pump(runner, width, expected_stride):
+    from types import SimpleNamespace
+
+    namespace = dict(MATCHING_PUMP_FWHM_FS=width,
+                     saved_pump_params=SimpleNamespace(dt=0.99*20/2997924.58))
+    node = runner["_matching_assignment"](runner["matching_setup_tree"], "INJECTION_CACHE_DT_FS")
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "requested-cache-spacing", "exec"), namespace)
+    tree = ast.parse(runner["matching_simulation_sources"]["cache_and_duration"])
+    node = runner["_matching_assignment"](tree, "cache_stride")
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "actual-cache-stride", "exec"), namespace)
+    assert namespace["cache_stride"] == expected_stride
+    assert namespace["INJECTION_CACHE_DT_FS"] == (None if width == 1.0 else 0.02)
+    source = _pure_pump_definitions(runner, width)
+    gaps = np.diff(source["pump_probe_indices"])
+    assert gaps.max() == (4 if width == 1.0 else 9)
 
 
 def _response_helper(runner, exponent):
@@ -838,3 +1005,7 @@ def test_case_cache_and_metadata_are_exponent_specific(runner):
         namespace = runner["_matching_case_namespace"](case)
         assert namespace["PUMP_FIELD_EXPONENT"] == case["exponent"]
         assert namespace["MATCHING_PUMP_PHASE_RAD"] == PHASE
+        assert namespace["MATCHING_PUMP_FWHM_FS"] == case["fwhm_fs"]
+        assert namespace["MATCHING_PUMP_NAME"] == f"pump_{case['fwhm_fs']:g}fs_1p5eV_sio2_12p82um"
+        assert Path(namespace["MATCHING_PUMP_PARENT"]).name == case["width_tag"]
+        assert Path(namespace["MATCHING_CASE_PARENT"]).parts[-2:] == (case["width_tag"], case["exponent_tag"])
